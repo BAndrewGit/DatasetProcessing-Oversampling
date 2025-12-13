@@ -9,17 +9,71 @@ sns.set_theme(style="whitegrid")
 #Univariate analysis
 def generate_univariate_plots(df, group_map, plots_dir):
     print("Starting Univariate Analysis...")
-    for group, cols in group_map.items():
+
+    # Helper to find groups of one-hot encoded columns
+    def find_one_hot_groups(cols):
+        groups = {}
         for col in cols:
-            if df[col].nunique() <= 1:
+            # Check for pattern like "Feature_Value"
+            parts = col.rsplit('_', 1)
+            if len(parts) == 2:
+                prefix, suffix = parts
+                # Heuristic: if we have multiple columns with same prefix in the list
+                if sum(1 for c in cols if c.startswith(prefix + '_')) > 1:
+                    if prefix not in groups:
+                        groups[prefix] = []
+                    groups[prefix].append(col)
+        return groups
+
+    for group, cols in group_map.items():
+        # Identify one-hot groups within this category
+        one_hot_groups = find_one_hot_groups(cols)
+        processed_cols = set()
+
+        # Plot one-hot groups as single bar charts
+        for prefix, group_cols in one_hot_groups.items():
+            # Calculate frequencies (percentages)
+            means = df[group_cols].mean().sort_values(ascending=False)
+            # Clean labels: remove prefix
+            labels = [c.replace(prefix + '_', '') for c in means.index]
+
+            plt.figure(figsize=(10, 6))
+            sns.barplot(x=means.values, y=labels, palette="viridis")
+            plt.title(f"Distribution of {prefix} (Frequency)", fontsize=14)
+            plt.xlabel("Frequency (0-1)")
+            plt.xlim(0, 1)
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "univariate", f"{group}_{prefix}_summary.png"),
+                        dpi=DPI, bbox_inches='tight')
+            plt.close()
+            print(f"- {group}/{prefix} summary saved")
+
+            processed_cols.update(group_cols)
+
+        # Plot remaining individual columns
+        for col in cols:
+            if col in processed_cols:
+                continue
+
+            if col not in df.columns or df[col].nunique() <= 1:
                 continue
 
             fig = plt.figure(figsize=(12, 5))
             fig.suptitle(f"{group} — {col}", fontsize=14, y=0.98)
 
             plt.subplot(1, 2, 1)
-            sns.histplot(df[col].dropna(), kde=True, bins=30, color='steelblue')
-            plt.title("Distribution", pad=10)
+            # Check if binary/categorical
+            if df[col].nunique() <= 10:
+                 # Bar plot for categorical/low cardinality
+                 counts = df[col].value_counts(normalize=True).sort_index()
+                 sns.barplot(x=counts.index, y=counts.values, color='steelblue')
+                 plt.ylabel("Frequency")
+                 plt.title("Distribution (Categorical)", pad=10)
+            else:
+                 # Hist/KDE for continuous
+                 sns.histplot(df[col].dropna(), kde=True, bins=30, color='steelblue', stat="density")
+                 plt.title("Distribution (Continuous)", pad=10)
 
             plt.subplot(1, 2, 2)
             sns.boxplot(x=df[col], color='salmon', showfliers=True,
@@ -83,6 +137,19 @@ def generate_bivariate_plots(df, group_map, plots_dir):
 #Target variable analysis
 def generate_target_plots(df, plots_dir):
     print("Starting Analysis vs Target...")
+
+    # Plot Target Distribution
+    if TARGET in df.columns:
+        plt.figure(figsize=(8, 6))
+        sns.histplot(df[TARGET], kde=True, color='purple', stat="density")
+        plt.title(f"Distribution of Target: {TARGET}", fontsize=14)
+        plt.xlabel(TARGET)
+        plt.ylabel("Density")
+        plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, "vs_target", f"Target_Distribution.png"),
+                    dpi=DPI, bbox_inches='tight')
+        plt.close()
+
     numeric_cols = [c for c in df.select_dtypes(include=np.number).columns if c != TARGET]
 
     corr_with_target = df[numeric_cols].corrwith(df[TARGET]).abs().sort_values(ascending=False)
