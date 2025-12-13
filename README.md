@@ -99,13 +99,13 @@ Procesare Dataset/
 
 ---
 
-### 1️⃣ **First Processing** - Data Preparation
+### **Step 1: Data Preprocessing** 
 
-**Location:** `FirstProcessing/main.py`
+**Run:** `FirstProcessing/main.py` (Right-click → Run 'main')
 
 **Purpose:** Transform raw survey data into machine-learning-ready format
 
-**Features:**
+**What it does:**
 - **Translation:** Romanian survey responses → English
 - **Normalization:** Standardize categorical values and ranges
 - **Feature Engineering:**
@@ -117,7 +117,6 @@ Procesare Dataset/
   - GMM clustering for automatic risk level assignment
   - Outlier detection using Isolation Forest
   - Confidence scoring for risk predictions
-- **Output:** Encoded CSV/Excel files with risk scores
 
 **Key Components:**
 - **Weights-based Risk Scoring:** Multi-factor weighted model considering:
@@ -128,56 +127,40 @@ Procesare Dataset/
   - Impulse buying patterns (0.063-0.068)
   - Savings goals and obstacles (0.055-0.051)
 
-**Usage:**
-Run `FirstProcessing/main.py` in PyCharm.
+**Input:** Raw survey CSV/Excel (Romanian language)
+**Output:** `encoded_data.csv` / `encoded_data.xlsx` with risk scores
 
 ---
 
-### 2️⃣ **EDA V1** - Initial Analysis
+### **Step 2: Exploratory Data Analysis** 
 
-**Location:** `EDA/V1/mainEDA.py`
+#### **Option A: Advanced Analysis (⭐ RECOMMENDED)**
 
-**Purpose:** Basic exploratory data analysis and model evaluation
-
-**Features:**
-- Duplicate detection and removal
-- Train/test split or synthetic data comparison
-- Model training (Logistic Regression, Random Forest, XGBoost, SVM)
-- Performance metrics (F1, ROC-AUC, Classification Report)
-- Basic visualization
-
-**Note:** V1 provides foundational analysis but has been superseded by V2 for more detailed insights.
-
----
-
-### 3️⃣ **EDA V2** - Advanced Analytics (⭐ RECOMMENDED)
-
-**Location:** `EDA/V2/mainEDA2.py`
+**Run:** `EDA/V2/mainEDA2.py` (Right-click → Run 'mainEDA2')
 
 **Purpose:** Comprehensive analysis with dimensionality reduction and clustering
 
-#### Features:
+**Features:**
 
-** Univariate Analysis:**
+**Univariate Analysis:**
 - Distribution plots for all features
 - Grouped by categories (demographic, expenses, behaviors, etc.)
-- **Grouped Feature Visualization:** Multi-option questions (e.g., Savings Goals) are visualized as single aggregated charts showing relative frequencies.
 
-** Bivariate Analysis:**
+**Bivariate Analysis:**
 - Correlation heatmaps
 - Feature relationships within groups
 
-** Target Analysis:**
+**Target Analysis:**
 - Risk score distribution
 - Feature vs. target relationships
 
-** PCA (Principal Component Analysis):**
+**PCA (Principal Component Analysis):**
 - Variance threshold: 80% (configurable in `config.py`)
 - Scree plots for component selection
 - Loading heatmaps showing feature contributions
 - Dimensionality reduction for visualization and clustering
 
-** Clustering Analysis:**
+**Clustering Analysis:**
 - **K-Means Clustering:**
   - Automatic optimal K selection via silhouette score
   - Range: 2-10 clusters (configurable)
@@ -191,7 +174,7 @@ Run `FirstProcessing/main.py` in PyCharm.
   - Crosstab correspondence analysis
   - Risk score distribution by cluster
 
-** Advanced Visualizations:**
+**Advanced Visualizations:**
 - Parallel coordinates plots
 - Radar charts for cluster profiles
 - Silhouette score comparisons
@@ -204,58 +187,79 @@ CLUSTERING_K_RANGE = (2, 11)       # K-Means range
 DPI = 300                          # High-quality plots
 TARGET = "Risk_Score"              # Target variable
 ```
+---
 
-**Usage:**
-Run `EDA/V2/mainEDA2.py` in PyCharm.
+#### **Option B: Basic Analysis**
 
-**Outputs:**
-- `plots/univariate/` - Individual feature distributions
-- `plots/bivariate/` - Feature correlations
-- `plots/vs_target/` - Target relationships
-- `plots/pca/` - PCA analysis results
-- `plots/clustering/` - Clustering visualizations
-- CSV files with PCA loadings and cluster assignments
+**Run:** `EDA/V1/mainEDA.py` (Right-click → Run 'mainEDA')
+
+**Purpose:** Basic exploratory data analysis and model evaluation
+
+**Features:**
+- Duplicate detection and removal
+- Train/test split or synthetic data comparison
+- Model training (Logistic Regression, Random Forest, XGBoost, SVM)
+- Performance metrics (F1, ROC-AUC, Classification Report)
+- Basic visualization
+
+**Input:** `encoded_data.csv` from Step 1
+**Output:** Model metrics + basic plots
+
+**Note:** V1 provides foundational analysis but has been superseded by V2 for more detailed insights.
 
 ---
 
-### 4️⃣ **Data Augmentation** - Synthetic Data Generation
+### **Step 3: Data Augmentation (Optional)** 
 
-**Location:** `DataAugmentation/`
+**When to use:** Imbalanced dataset or need more training samples
 
-**Purpose:** Balance datasets and generate synthetic samples for minority classes
+#### **Method A: SMOTE-Tomek ( Fast & Reliable)**
 
-#### Available Methods:
+**Run:** `DataAugmentation/smote_tomek.py` (Right-click → Run)
 
-** CTGAN (Conditional GAN)**
-- `CTGan_Augmentation.py`
-- Conditional Tabular GAN using SDV library
-- Balanced class generation
-- Iterative quality validation
-- Minimum confidence threshold: 0.8
-- Step-wise generation with metrics tracking
-
-**️ SMOTE-Tomek**
-- `smote_tomek.py`
+**What it does:**
 - Hybrid oversampling + undersampling
 - SMOTE for minority class synthesis
 - Tomek links removal for boundary cleaning
 - Validation metrics: F1-weighted, silhouette score, Cohen's kappa
 - Feature importance ranking via F-statistics
 
-** WGAN**
-- `WC_GAN.py`
-- Wasserstein GAN with gradient penalty
-- More stable training than vanilla GAN
+**Best for:**
+- Quick augmentation
+- Small datasets (<500 samples)
+- Pre-processing for WGAN
 
-**Base Class Features:**
-- Automatic data loading and preparation
-- Feature scaling (StandardScaler/RobustScaler)
-- Model evaluation integration
-- Excel/CSV export with auto-adjusted columns
-- Metrics history tracking
+**Output:** `augmented_dataset_encoded.csv` / `.xlsx`
 
-**Usage Example:**
-Run `DataAugmentation/CTGan_Augmentation.py` (or other scripts) in PyCharm.
+---
+
+#### **Method B: CTGAN ( High Quality - Recommended)**
+
+**Run:** `DataAugmentation/CTGan_Augmentation.py` (Right-click → Run)
+
+**What it does:**
+- Conditional Tabular GAN using SDV library
+- Balanced class generation
+- Iterative quality validation
+- Minimum confidence threshold: 0.8
+- Step-wise generation with metrics tracking
+
+**Best for:**
+- High-quality synthetic data
+- Medium datasets (500-2000 samples)
+- Handling categorical features
+
+**Usage:**
+```python
+from DataAugmentation.CTGan_Augmentation import CTGANAugmentation
+
+augmentor = CTGANAugmentation(
+    target_column="Behavior_Risk_Level",
+    step_fraction=0.25,
+    max_size=2000
+)
+# Interactive workflow follows
+```
 
 ---
 
@@ -344,8 +348,7 @@ Run `DataAugmentation/CTGan_Augmentation.py` (or other scripts) in PyCharm.
 - Clustering K range
 - Plot DPI settings
 
-### `FirstProcessing/main.py`
-- CONFIG dict
+### `FirstProcessing/main.py` - CONFIG dict
 - Risk scoring weights
 - Multi-value column definitions
 
@@ -366,24 +369,32 @@ See `requirements.txt` for complete list.
 ## 🎯 Typical Usage Workflow
 
 1. **Prepare Data:**
-   - Run `FirstProcessing/main.py`
+   ```cmd
+   python -m FirstProcessing.main
+   ```
    - Select raw survey CSV/Excel
    - Outputs encoded dataset with risk scores
 
 2. **Run Advanced EDA:**
-   - Run `EDA/V2/mainEDA2.py`
+   ```cmd
+   python -m EDA.V2.mainEDA2
+   ```
    - Select processed dataset
    - Choose output directory
    - Generates comprehensive analysis and plots
 
 3. **Optional - Augment Data:**
-   - Run `DataAugmentation/CTGan_Augmentation.py`
+   ```cmd
+   python -m DataAugmentation.CTGan_Augmentation
+   ```
    - Select training dataset
    - Define augmentation parameters
    - Outputs balanced synthetic dataset
 
 4. **Optional - Train Models (V1):**
-   - Run `EDA/V1/mainEDA.py`
+   ```cmd
+   python -m EDA.V1.mainEDA
+   ```
    - Select test and train datasets
    - Evaluates model performance
 
@@ -409,4 +420,5 @@ See `requirements.txt` for complete list.
 - `augmentation_metrics.json` - Quality metrics per iteration
 
 ---
+
 
