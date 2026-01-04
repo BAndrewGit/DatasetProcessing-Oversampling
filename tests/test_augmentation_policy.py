@@ -1,23 +1,51 @@
 import copy
-import run_experiment as rexp
+import pytest
+from experiments.config_schema import validate_baseline_config, ConfigValidationError
 
 
-def test_baseline_forces_augmentation_off(
-    base_regression_config, write_yaml, patch_dataset_loader, freeze_time
-):
+def test_baseline_config_rejects_augmentation_enabled(base_regression_config):
     """
-    Your run_experiment explicitly disables augmentation if enabled.
-    This test guarantees you never silently run augmented baselines.
+    Baseline config MUST have augmentation disabled.
+    If enabled, should raise ConfigValidationError (not silently disable).
     """
     cfg = copy.deepcopy(base_regression_config)
-    cfg["augmentation"]["enabled"] = True  # should be force-disabled
+    cfg["augmentation"]["enabled"] = True
+
+    with pytest.raises(ConfigValidationError, match="Augmentation is enabled"):
+        validate_baseline_config(cfg)
+
+
+def test_baseline_runner_requires_augmentation_disabled(
+    base_regression_config, write_yaml, patch_dataset_loader
+):
+    """
+    run_baseline should fail if augmentation is enabled in config.
+    """
+    cfg = copy.deepcopy(base_regression_config)
+    cfg["augmentation"]["enabled"] = True
 
     cfg_path = write_yaml(cfg, "aug_enabled.yaml")
-    run_dir = rexp.run_experiment(cfg_path, dataset_path="IGNORED.csv")
 
-    # Ensure config saved has augmentation disabled
-    import yaml, os
-    with open(os.path.join(run_dir, "config.yaml"), "r") as f:
-        saved = yaml.safe_load(f)
-    assert saved.get("augmentation", {}).get("enabled", False) is False
+    import run_baseline
+    with pytest.raises(ConfigValidationError, match="Augmentation is enabled"):
+        run_baseline.run_baseline(cfg_path, dataset_path="IGNORED.csv")
+
+
+def test_baseline_with_disabled_augmentation_succeeds(
+    base_regression_config, write_yaml, patch_dataset_loader
+):
+    """
+    Baseline should succeed when augmentation is properly disabled.
+    """
+    cfg = copy.deepcopy(base_regression_config)
+    cfg["augmentation"]["enabled"] = False
+
+    cfg_path = write_yaml(cfg, "baseline_correct.yaml")
+
+    import run_baseline
+    run_dir = run_baseline.run_baseline(cfg_path, dataset_path="IGNORED.csv")
+
+    import os
+    assert os.path.isdir(run_dir)
+    assert os.path.isfile(os.path.join(run_dir, "metrics.json"))
 

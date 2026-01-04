@@ -35,38 +35,15 @@ except ImportError:
     HAS_SMOTE = False
 
 from DataAugmentation.quality_gates import SyntheticQualityGates, validate_synthetic_ratio
+from experiments.config_schema import validate_augmentation_config, ConfigValidationError, FORBIDDEN_TARGETS
+from experiments.io import load_config, save_data_profile, dataset_hash
+from experiments.data import load_dataset, validate_save_money_consistency
 
 
 def set_seeds(seed):
     random.seed(seed)
     np.random.seed(seed)
 
-
-def load_config(config_path):
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
-
-
-FORBIDDEN_TARGETS = ["Behavior_Risk_Level"]
-
-
-def load_dataset(path):
-    if path is None:
-        from tkinter import Tk, filedialog
-        root = Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        print("Select the dataset file...")
-        path = filedialog.askopenfilename(
-            filetypes=[("CSV files", "*.csv")],
-            parent=root
-        )
-        root.destroy()
-        if not path:
-            raise ValueError("No dataset selected")
-
-    print(f"Loading dataset: {path}")
-    return pd.read_csv(path)
 
 
 def generate_synthetic_smote(X_train, y_train, ratio=0.15, seed=42):
@@ -154,6 +131,14 @@ def generate_cluster_synthetic(X_train, y_train, target_type='regression', ratio
 
 def run_augmentation_experiment(config_path, dataset_path=None):
     config = load_config(config_path)
+
+    # Validate config for augmentation mode
+    try:
+        validate_augmentation_config(config)
+    except ConfigValidationError as e:
+        print(f"\nCONFIG ERROR:\n{e}")
+        raise
+
     seed = config['experiment']['seed']
     set_seeds(seed)
 
@@ -169,7 +154,10 @@ def run_augmentation_experiment(config_path, dataset_path=None):
     print("=" * 70)
 
     # Load data
-    df = load_dataset(dataset_path or config['data'].get('dataset_path'))
+    df, actual_path = load_dataset(config, dataset_path)
+
+    # Validate Save_Money consistency
+    validate_save_money_consistency(df)
 
     target = config['data']['target_column']
     target_type = config['data'].get('target_type', 'regression')

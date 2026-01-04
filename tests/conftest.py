@@ -5,8 +5,15 @@ import pytest
 import pandas as pd
 import numpy as np
 
-# Update this import if your module name differs
-import run_experiment as rexp
+# Import from modular experiments package
+from experiments.config_schema import validate_config, validate_baseline_config, ConfigValidationError
+from experiments.io import load_config, config_hash, dataset_hash, create_run_dir, save_results, save_data_profile
+from experiments.data import load_dataset, preprocess_data, validate_data_integrity, validate_save_money_consistency
+from experiments.models import build_model
+from experiments.cv import run_repeated_cv_regression, run_repeated_cv_classification
+
+# Import baseline runner
+import run_baseline
 
 
 @pytest.fixture(scope="session")
@@ -40,7 +47,7 @@ def tiny_adv_df(seed):
     df["Debt_Level"] = rng.integers(0, 5, size=n)
     df["Impulse_Buying_Frequency"] = rng.integers(0, 5, size=n)
     df["Budget_Planning_Plan in detail"] = rng.integers(0, 2, size=n)
-    df["Save_Money_Yes_feature_duplicate"] = df["Save_Money_Yes"]  # used to test leakage if not ignored/dropped
+    df["Save_Money_Yes_feature_duplicate"] = df["Save_Money_Yes"]
 
     return df
 
@@ -49,7 +56,6 @@ def tiny_adv_df(seed):
 def base_regression_config(tmp_path, seed):
     """
     Minimal config for regression baseline on Risk_Score.
-    Writes a YAML file for the pipeline.
     """
     cfg = {
         "experiment": {
@@ -125,12 +131,13 @@ def base_classification_config(tmp_path, seed):
 @pytest.fixture
 def patch_dataset_loader(monkeypatch, tiny_adv_df):
     """
-    Monkeypatch load_dataset so run_experiment doesn't hit disk.
+    Monkeypatch load_dataset so experiments don't hit disk.
     """
     def _fake_load_dataset(config, dataset_path=None):
-        return tiny_adv_df.copy()
+        return tiny_adv_df.copy(), "test_dataset.csv"
 
-    monkeypatch.setattr(rexp, "load_dataset", _fake_load_dataset)
+    monkeypatch.setattr("experiments.data.load_dataset", _fake_load_dataset)
+    monkeypatch.setattr("run_baseline.load_dataset", _fake_load_dataset)
     return _fake_load_dataset
 
 
@@ -139,18 +146,18 @@ def freeze_time(monkeypatch):
     """
     Make run_dir deterministic by freezing datetime.now().
     """
+    import datetime as dt
+
     class _FixedDT:
-        @classmethod
-        def now(cls):
-            # 2026-01-04 12:34:56
-            import datetime
-            return datetime.datetime(2026, 1, 4, 12, 34, 56)
+        @staticmethod
+        def now():
+            return dt.datetime(2026, 1, 4, 12, 34, 56)
 
-        @classmethod
-        def strftime(cls, fmt):
-            return cls.now().strftime(fmt)
+        @staticmethod
+        def strftime(fmt):
+            return _FixedDT.now().strftime(fmt)
 
-    monkeypatch.setattr(rexp, "datetime", _FixedDT)
+    monkeypatch.setattr("experiments.io.datetime", _FixedDT)
     return _FixedDT
 
 
