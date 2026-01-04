@@ -5,44 +5,92 @@
 This project implements a comprehensive data processing and analysis pipeline for **financial behavior risk assessment**. The system processes survey data about financial habits, spending patterns, and economic behaviors to predict and analyze financial risk levels.
 
 ### Key Features
--  **Data Preprocessing & Normalization** - Translation, encoding, and feature engineering
--  **Advanced Exploratory Data Analysis (EDA)** - Statistical analysis with multiple visualization techniques
--  **Dimensionality Reduction** - PCA analysis for feature extraction
--  **Clustering Analysis** - K-Means and GMM clustering for behavioral segmentation
--  **Machine Learning Models** - Multiple classification algorithms for risk prediction
--  **Reproducible Experiments** - Single entrypoint with YAML configs for consistent results
+- **Data Preprocessing & Normalization** - Translation, encoding, and feature engineering
+- **Advanced Exploratory Data Analysis (EDA)** - Statistical analysis with multiple visualization techniques
+- **Dimensionality Reduction** - PCA analysis for feature extraction
+- **Clustering Analysis** - K-Means and GMM clustering for behavioral segmentation
+- **Reproducible Experiments** - Single entrypoint with YAML configs for consistent results
+- **Synthetic Data Quality Gates** - Rigorous validation before using any synthetic data
+- **Comprehensive Test Suite** - Pytest-based tests for reproducibility verification
 
 ---
 
-## ⚠️ IMPORTANT: Clean Baseline Rules
+## ⚠️ CRITICAL: Clean Baseline Rules (NON-NEGOTIABLE)
 
-**`Behavior_Risk_Level` is FORBIDDEN as a training target** (circular label derived from features).
+### Forbidden Targets
+**`Behavior_Risk_Level` is FORBIDDEN as a training target** - This is a circular label derived from features.
 
-**Allowed Targets:**
-- **Primary:** `Risk_Score` → continuous regression
-- **Secondary:** `Save_Money_Yes` → binary classification
+### Allowed Targets (LOCKED)
+| Target | Type | Use Case |
+|--------|------|----------|
+| `Risk_Score` | Continuous | **Primary** - Regression |
+| `Save_Money_Yes` | Binary | **Secondary** - Classification |
+
+### Hard Removals (FOREVER)
+- Retrain loops on enriched data
+- Exponential dataset growth
+- Final 50/50 balancing
+- GAN retraining on synthetic output
 
 ---
 
-## 🚀 Quick Start - Clean Baselines
+## 🚀 Quick Start
+
+### Installation
 
 ```bash
-# Run regression baseline (Risk_Score target)
+# Install dependencies
+pip install -r requirements.txt
+
+# Or minimal dependencies
+pip install -r requirements_minimal.txt
+```
+
+### Run Clean Baselines
+
+```bash
+# Run regression baseline (Risk_Score target) - PRIMARY
 python run_experiment.py --config configs/baseline_regression.yaml --dataset path/to/data.csv
 
-# Run classification baseline (Save_Money target)
+# Run classification baseline (Save_Money target) - SECONDARY
 python run_experiment.py --config configs/baseline_classification.yaml --dataset path/to/data.csv
 
 # Run ALL baselines at once
 python run_experiment.py --all-baselines --dataset path/to/data.csv
 ```
 
-### Output per Run
-Each run produces a folder in `runs/` containing:
-- `config.yaml` - Experiment configuration
-- `metrics.json` - All CV metrics (mean ± std)
-- `model.joblib` - Trained model
-- `cv_distribution.png` - Cross-validation score distribution
+### Run Augmentation Experiment (Tests if synthetic helps)
+
+```bash
+# Test whether synthetic data improves real-only performance
+python augmentation_experiment.py --config configs/augmentation_experiment.yaml --dataset path/to/data.csv
+```
+
+### Run Tests
+
+```bash
+# Install test dependencies
+pip install pytest pytest-cov
+
+# Run all tests
+pytest -v
+
+# Run with coverage
+pytest --cov=. --cov-report=html
+```
+
+---
+
+## 📊 Output per Run
+
+Each experiment run produces a folder in `runs/` containing:
+
+| File | Description |
+|------|-------------|
+| `config.yaml` | Experiment configuration used |
+| `metrics.json` | All CV metrics (mean ± std) |
+| `model.joblib` | Trained model (sklearn format) |
+| `cv_distribution.png` | Cross-validation score distribution |
 
 ### Validation Protocol
 - **Repeated K-Fold CV:** 5 folds × 10 repeats = 50 evaluations
@@ -55,417 +103,335 @@ Each run produces a folder in `runs/` containing:
 
 ```
 Procesare Dataset/
-├── run_experiment.py         # MAIN ENTRYPOINT for reproducible experiments
-├── configs/                  # Experiment configurations
-│   ├── baseline_regression.yaml    # Risk_Score regression (PRIMARY)
-│   ├── baseline_classification.yaml # Save_Money classification (SECONDARY)
-│   ├── default.yaml                 # Legacy config
-│   └── smote_experiment.yaml        # SMOTE augmentation config
-├── runs/                     # Output folder for experiment runs
+├── run_experiment.py              # MAIN ENTRYPOINT - reproducible experiments
+├── augmentation_experiment.py     # Controlled synthetic augmentation testing
+├── pytest.ini                     # Pytest configuration
 │
-├── FirstProcessing/          # Initial data processing pipeline
-│   ├── main.py               # Entry point for data preprocessing
-│   ├── preprocessing.py      # Data normalization and translation (RO→EN)
-│   ├── risk_calculation.py   # Risk scoring and clustering algorithms
-│   ├── encoder.py            # Feature encoding utilities
-│   ├── data_generation.py    # Feature engineering and generation
-│   └── file_operations.py    # File I/O and Excel formatting
+├── configs/                       # Experiment configurations (YAML)
+│   ├── baseline_regression.yaml         # Risk_Score regression (PRIMARY)
+│   ├── baseline_classification.yaml     # Save_Money classification (SECONDARY)
+│   ├── augmentation_experiment.yaml     # Synthetic augmentation testing
+│   ├── default.yaml                     # Default config template
+│   └── smote_experiment.yaml            # SMOTE augmentation config
 │
-├── EDA/                      # Exploratory Data Analysis modules
-│   ├── V1/                   # Initial EDA implementation
-│   │   ├── mainEDA.py        # Main EDA workflow
-│   │   ├── data_loading.py   # Data loading utilities
-│   │   ├── preprocessing.py  # Data preprocessing
-│   │   ├── visualization.py  # Visualization functions
-│   │   └── model_training.py # ML model training and evaluation
+├── tests/                         # Test suite (pytest)
+│   ├── conftest.py                      # Fixtures and test utilities
+│   ├── test_config.py                   # Config validation tests
+│   ├── test_data_integrity.py           # Data preprocessing tests
+│   ├── test_cv_and_leakage.py           # CV and leakage detection tests
+│   ├── test_augmentation_policy.py      # Augmentation policy tests
+│   ├── test_reproducibility.py          # Reproducibility verification
+│   └── test_artifacts.py                # Output artifact tests
+│
+├── runs/                          # Output folder for experiment runs
+│
+├── FirstProcessing/               # Initial data processing pipeline
+│   ├── main.py                          # Entry point for preprocessing
+│   ├── preprocessing.py                 # Data normalization (RO→EN translation)
+│   ├── risk_calculation.py              # Risk scoring and clustering
+│   ├── encoder.py                       # Feature encoding utilities
+│   ├── data_generation.py               # Feature engineering
+│   └── file_operations.py               # File I/O and Excel formatting
+│
+├── EDA/                           # Exploratory Data Analysis
+│   ├── V1/                              # Basic EDA (legacy)
+│   │   ├── mainEDA.py
+│   │   ├── data_loading.py
+│   │   ├── preprocessing.py
+│   │   ├── visualization.py
+│   │   └── model_training.py
 │   │
-│   └── V2/                   # Enhanced EDA with advanced analytics (CURRENT)
-│       ├── mainEDA2.py       # Main EDA workflow with PCA and clustering
-│       ├── config.py         # Configuration settings
-│       ├── data_loader.py    # Data loading and preparation
-│       ├── plot_generator.py # Comprehensive plotting functions
-│       ├── utils.py          # Utility functions
-│       ├── PCA/              # Principal Component Analysis
-│       │   ├── pca_transformer.py  # PCA fitting and transformation
-│       │   └── pca_visualizer.py   # PCA visualization (scree plots, loadings)
-│       └── clustering/       # Clustering analysis
-│           ├── kmeans_clustering.py      # K-Means implementation
-│           ├── gmm_clustering.py         # Gaussian Mixture Models
-│           ├── cluster_comparison.py     # Cluster method comparison
-│           └── cluster_visualizer.py     # Cluster visualization
+│   └── V2/                              # Advanced EDA (CURRENT)
+│       ├── mainEDA2.py                  # Main workflow with PCA + clustering
+│       ├── config.py                    # Configuration settings
+│       ├── data_loader.py               # Data loading and preparation
+│       ├── plot_generator.py            # Comprehensive plotting
+│       ├── utils.py                     # Utility functions
+│       ├── PCA/                         # Principal Component Analysis
+│       │   ├── pca_transformer.py
+│       │   └── pca_visualizer.py
+│       └── clustering/                  # Clustering analysis
+│           ├── kmeans_clustering.py
+│           ├── gmm_clustering.py
+│           ├── cluster_comparison.py
+│           └── cluster_visualizer.py
 │
-├── DataAugmentation/         # DEPRECATED - use run_experiment.py instead
-│   └── (legacy augmentation scripts)
-├── DataAugmentation/         # Synthetic data generation
-│   ├── base.py               # Base augmentation class
-│   ├── CTGan_Augmentation.py # Conditional GAN augmentation
-│   ├── smote_tomek.py        # SMOTE-Tomek hybrid sampling
-│   └── WC_GAN.py             # Wasserstein GAN augmentation
+├── DataAugmentation/              # Synthetic data generation
+│   ├── __init__.py                      # Module exports
+│   ├── base.py                          # Base augmentation class
+│   ├── quality_gates.py                 # Synthetic data quality gates
+│   ├── cluster_enrichment.py            # Cluster-aware enrichment
+│   ├── smote_tomek.py                   # SMOTE-Tomek (DEPRECATED)
+│   ├── CTGan_Augmentation.py            # CTGAN augmentation
+│   └── WC_GAN.py                        # Wasserstein GAN
 │
-├── Old/                      # Deprecated experiments (not in use)
-│   ├── ADASYN_WCGAN_Augmentation.py
-│   ├── SMOTE_VAE_Augmentation.py
-│   └── WCGAN_Augmentation.py
+├── Old/                           # Deprecated experiments (DO NOT USE)
 │
-├── scaler/                   # Saved preprocessing models
+├── scaler/                        # Saved preprocessing models
 │   └── robust_scaler.pkl
 │
-└── requirements.txt          # Python dependencies
+├── requirements.txt               # Full Python dependencies
+└── requirements_minimal.txt       # Minimal dependencies
 ```
 
 ---
 
-## 🚀 Getting Started
+## 🔬 Synthetic Data Quality Gates (Sprint 2)
 
-### Prerequisites
-- Python 3.10+
-- PyCharm IDE (or any Python IDE)
-- Virtual environment (recommended)
+Before any synthetic data is used, it must pass **ALL** quality gates:
 
-### Installation
+### Gate 1: Memorization Test
+Synthetic samples must not be near-duplicates of real samples.
 
-1. **Open the project in PyCharm:**
-   - File → Open → Select `Procesare Dataset` folder
+### Gate 2: Two-Sample Test
+A classifier trying to distinguish real vs synthetic must have AUC < 0.75.
 
-2. **Configure Python Interpreter:**
-   - File → Settings → Project → Python Interpreter
-   - Create new virtual environment or select existing Python 3.10+
+### Gate 3: Utility Test
+Training on real+synthetic must improve (or not hurt) real-only test performance.
 
-3. **Install dependencies:**
-   - Open PyCharm Terminal and run:
-     ```bash
-     pip install -r requirements.txt
-     ```
-   - Or use PyCharm's automatic dependency detection
+### Gate 4: Stability Test
+Variance across CV folds must not increase by more than 20%.
+
+### Quality Gates Logic
+```
+For each CV fold:
+  1. Generate synthetic data INSIDE the fold
+  2. Run all 4 quality gates
+  3. If ALL gates pass → use augmented training data
+  4. If ANY gate fails → use real-only training data
+  
+Final verdict:
+  - "useful" if improvement > 1% AND stability not degraded
+  - "not_useful" otherwise (this is valid science!)
+```
+
+### Synthetic Ratio Limits
+- Minimum: 15%
+- Maximum: 30%
+- **Never** exceed these bounds
 
 ---
 
-## 📊 Workflow
+## 📋 Workflow
 
-**Complete Workflow** - Run modules in PyCharm following this order:
+### Step 1: Data Preprocessing
 
----
+```bash
+python -m FirstProcessing.main
+```
 
-### **Step 1: Data Preprocessing** 
-
-**Run:** `FirstProcessing/main.py` (Right-click → Run 'main')
-
-**Purpose:** Transform raw survey data into machine-learning-ready format
+**Purpose:** Transform raw survey data into ML-ready format
 
 **What it does:**
-- **Translation:** Romanian survey responses → English
-- **Normalization:** Standardize categorical values and ranges
-- **Feature Engineering:**
-  - Age grouping and income categorization
-  - Product lifetime estimation
-  - Essential needs percentage calculation
-- **Risk Calculation:**
-  - Weighted risk scoring based on 15+ financial behavior features
-  - GMM clustering for automatic risk level assignment
-  - Outlier detection using Isolation Forest
-  - Confidence scoring for risk predictions
+- Translation: Romanian → English
+- Normalization: Standardize categorical values
+- Feature Engineering: Age grouping, income categorization, product lifetime
+- Risk Calculation: Weighted scoring (15+ features), GMM clustering, outlier detection
 
-**Key Components:**
-- **Weights-based Risk Scoring:** Multi-factor weighted model considering:
-  - Budget planning habits (0.097)
-  - Age demographics (0.078)
-  - Family status (0.072-0.065)
-  - Financial investments (0.071)
-  - Impulse buying patterns (0.063-0.068)
-  - Savings goals and obstacles (0.055-0.051)
-
-**Input:** Raw survey CSV/Excel (Romanian language)
-**Output:** `encoded_data.csv` / `encoded_data.xlsx` with risk scores
+**Output:** `encoded_data.csv` / `encoded_data.xlsx`
 
 ---
 
-### **Step 2: Exploratory Data Analysis** 
+### Step 2: Exploratory Data Analysis
 
-#### **Option A: Advanced Analysis (⭐ RECOMMENDED)**
-
-**Run:** `EDA/V2/mainEDA2.py` (Right-click → Run 'mainEDA2')
-
-**Purpose:** Comprehensive analysis with dimensionality reduction and clustering
+```bash
+python -m EDA.V2.mainEDA2
+```
 
 **Features:**
-
-**Univariate Analysis:**
-- Distribution plots for all features
-- Grouped by categories (demographic, expenses, behaviors, etc.)
-
-**Bivariate Analysis:**
+- Univariate/Bivariate analysis
 - Correlation heatmaps
-- Feature relationships within groups
-
-**Target Analysis:**
-- Risk score distribution
-- Feature vs. target relationships
-
-**PCA (Principal Component Analysis):**
-- Variance threshold: 80% (configurable in `config.py`)
-- Scree plots for component selection
-- Loading heatmaps showing feature contributions
-- Dimensionality reduction for visualization and clustering
-
-**Clustering Analysis:**
-- **K-Means Clustering:**
-  - Automatic optimal K selection via silhouette score
-  - Range: 2-10 clusters (configurable)
-  - Cluster visualization in PCA space
-- **Gaussian Mixture Models (GMM):**
-  - Probabilistic cluster assignment
-  - Soft clustering with confidence scores
-- **Comparison Metrics:**
-  - Adjusted Rand Index (ARI)
-  - Agreement rate between methods
-  - Crosstab correspondence analysis
-  - Risk score distribution by cluster
-
-**Advanced Visualizations:**
-- Parallel coordinates plots
-- Radar charts for cluster profiles
-- Silhouette score comparisons
-- Box plots and bar charts for risk distribution
+- PCA (80% variance threshold)
+- K-Means and GMM clustering
+- Cluster comparison metrics
 
 **Configuration** (`EDA/V2/config.py`):
 ```python
-PCA_VARIANCE_THRESHOLD = 0.80      # 80% variance retention
-CLUSTERING_K_RANGE = (2, 11)       # K-Means range
-DPI = 300                          # High-quality plots
-TARGET = "Risk_Score"              # Target variable
+PCA_VARIANCE_THRESHOLD = 0.80
+CLUSTERING_K_RANGE = (2, 11)
+TARGET = "Risk_Score"
+DPI = 300
 ```
----
-
-#### **Option B: Basic Analysis**
-
-**Run:** `EDA/V1/mainEDA.py` (Right-click → Run 'mainEDA')
-
-**Purpose:** Basic exploratory data analysis and model evaluation
-
-**Features:**
-- Duplicate detection and removal
-- Train/test split or synthetic data comparison
-- Model training (Logistic Regression, Random Forest, XGBoost, SVM)
-- Performance metrics (F1, ROC-AUC, Classification Report)
-- Basic visualization
-
-**Input:** `encoded_data.csv` from Step 1
-**Output:** Model metrics + basic plots
-
-**Note:** V1 provides foundational analysis but has been superseded by V2 for more detailed insights.
 
 ---
 
-### **Step 3: Data Augmentation (Optional)** 
+### Step 3: Run Baseline Experiments
 
-**When to use:** Imbalanced dataset or need more training samples
+```bash
+# Primary target: Risk_Score (regression)
+python run_experiment.py --config configs/baseline_regression.yaml --dataset data.csv
 
-#### **Method A: SMOTE-Tomek ( Fast & Reliable)**
+# Secondary target: Save_Money_Yes (classification)
+python run_experiment.py --config configs/baseline_classification.yaml --dataset data.csv
+```
 
-**Run:** `DataAugmentation/smote_tomek.py` (Right-click → Run)
+**Models Available:**
 
-**What it does:**
-- Hybrid oversampling + undersampling
-- SMOTE for minority class synthesis
-- Tomek links removal for boundary cleaning
-- Validation metrics: F1-weighted, silhouette score, Cohen's kappa
-- Feature importance ranking via F-statistics
-
-**Best for:**
-- Quick augmentation
-- Small datasets (<500 samples)
-- Pre-processing for WGAN
-
-**Output:** `augmented_dataset_encoded.csv` / `.xlsx`
+| Regression | Classification |
+|------------|----------------|
+| Ridge | Logistic Regression |
+| Lasso | Random Forest |
+| XGBoost Regressor | XGBoost Classifier |
+| LightGBM Regressor | LightGBM Classifier |
+| Random Forest Regressor | |
 
 ---
 
-#### **Method B: CTGAN ( High Quality - Recommended)**
+### Step 4: Test Synthetic Augmentation (Optional)
 
-**Run:** `DataAugmentation/CTGan_Augmentation.py` (Right-click → Run)
+```bash
+python augmentation_experiment.py --config configs/augmentation_experiment.yaml --dataset data.csv
+```
 
-**What it does:**
-- Conditional Tabular GAN using SDV library
-- Balanced class generation
-- Iterative quality validation
-- Minimum confidence threshold: 0.8
-- Step-wise generation with metrics tracking
+**Methods available:**
+- `jitter` - Gaussian noise injection (default for regression)
+- `smote` - SMOTE oversampling (for classification)
+- `cluster` - Cluster-aware enrichment (max 20% per cluster)
 
-**Best for:**
-- High-quality synthetic data
-- Medium datasets (500-2000 samples)
-- Handling categorical features
+**Output:**
+- Verdict: "useful" or "not_useful"
+- Comparison metrics: real-only vs augmented
+- Quality gate results per fold
 
-**Usage:**
-```python
-from DataAugmentation.CTGan_Augmentation import CTGANAugmentation
+---
 
-augmentor = CTGANAugmentation(
-    target_column="Behavior_Risk_Level",
-    step_fraction=0.25,
-    max_size=2000
-)
-# Interactive workflow follows
+## 🧪 Test Suite
+
+The project includes a comprehensive test suite:
+
+| Test File | Purpose |
+|-----------|---------|
+| `test_config.py` | Validates forbidden target blocking, config hashing |
+| `test_data_integrity.py` | Ensures proper feature/target separation |
+| `test_cv_and_leakage.py` | Verifies CV returns expected metrics |
+| `test_augmentation_policy.py` | Confirms baseline forces augmentation OFF |
+| `test_reproducibility.py` | Same seed = same results |
+| `test_artifacts.py` | Checks all output files are created |
+
+```bash
+# Run all tests
+pytest -v
+
+# Run specific test file
+pytest tests/test_reproducibility.py -v
+
+# Run with coverage report
+pytest --cov=. --cov-report=term-missing
 ```
 
 ---
 
 ## 📁 Data Format
 
-### Input Data (Raw Survey)
-- **Format:** CSV/Excel (Romanian language)
-- **Columns:** ~22 survey questions covering:
-  - Demographics (age, gender, family status, income)
-  - Financial attitudes and behaviors
-  - Budget planning habits
-  - Savings goals and obstacles
-  - Impulse buying patterns
-  - Credit usage and debt levels
-  - Investment behaviors
-  - Product lifetime usage
+### Input (Raw Survey)
+- Format: CSV/Excel (Romanian language)
+- ~22 survey questions covering demographics, financial behaviors, savings, etc.
 
-### Processed Data (Encoded)
-- **Format:** CSV/Excel (English, encoded)
-- **Features:** 80+ one-hot encoded binary features
-- **Target Variables:**
-  - `Risk_Score` (continuous): Weighted risk metric
-  - `Behavior_Risk_Level` (binary): 0 = Low Risk, 1 = High Risk
-- **Metadata:**
-  - `Confidence`: Prediction confidence (0-1)
-  - `Cluster`: GMM cluster assignment
-  - `Outlier`: Binary outlier flag
+### Processed (Encoded)
+- Format: CSV/Excel (English, encoded)
+- 80+ one-hot encoded features
+- Target variables:
+  - `Risk_Score` (continuous) - **USE THIS**
+  - `Behavior_Risk_Level` (binary) - **FORBIDDEN AS TARGET**
+- Metadata: `Confidence`, `Cluster`, `Outlier`
 
 ---
 
-## 🔧 Technical Details
+## ⚙️ Configuration Reference
 
-### Machine Learning Models (EDA/V1 & V2)
-1. **Logistic Regression** - Baseline linear model
-2. **Random Forest** - Ensemble decision trees (150 estimators)
-3. **XGBoost** - Gradient boosting (100 estimators)
-4. **SVM** - Support Vector Machine (with SGD fallback for large datasets)
+### `configs/baseline_regression.yaml`
+```yaml
+experiment:
+  name: "clean_baseline_regression"
+  seed: 42
 
-### Evaluation Metrics
-- F1 Score (macro/weighted)
-- ROC-AUC
-- Classification Report (precision, recall)
-- Confusion Matrix
-- Cross-Validation (5-fold Stratified)
+data:
+  target_column: "Risk_Score"
+  target_type: "regression"
 
-### Risk Scoring Methodology
-1. **Feature Weighting:** 15 most important features identified via SHAP/XGBoost
-2. **Normalization:** RobustScaler to handle outliers
-3. **Clustering:** Bayesian GMM (2-8 components) on risk scores
-4. **Labeling:** Silhouette-optimized cluster assignment
-5. **Validation:** KNN classifier verification
+preprocessing:
+  ignored_columns: ["Behavior_Risk_Level"]
 
----
+augmentation:
+  enabled: false  # OFF for baseline
 
-## 📊 Key Visualizations
+cross_validation:
+  n_splits: 5
+  n_repeats: 10
+```
 
-### EDA V2 Generates:
-1. **Distribution Plots** - Histograms and KDE for all features
-2. **Correlation Heatmaps** - Within-group feature relationships
-3. **PCA Scree Plot** - Variance explained by components
-4. **Loading Heatmap** - Feature contributions to PCs
-5. **Cluster Scatter Plots** - K-Means vs GMM in PCA space
-6. **Silhouette Comparison** - Cluster quality metrics
-7. **Risk Score Box Plots** - Distribution per cluster
-8. **Parallel Coordinates** - Multi-dimensional cluster profiles
-9. **Radar Charts** - Normalized cluster characteristics
-10. **Crosstab Heatmap** - Cluster correspondence matrix
+### `configs/augmentation_experiment.yaml`
+```yaml
+augmentation:
+  enabled: true
+  synthetic_ratio: 0.15  # 15%
+  max_ratio: 0.30        # Never exceed 30%
+  method: "jitter"       # jitter, smote, or cluster
+
+quality_gates:
+  memorization_threshold: 0.05
+  max_discriminator_auc: 0.75
+```
 
 ---
 
-## ⚠️ Known Limitations & Notes
+## 📚 Dependencies
 
-- **Old folder:** Contains deprecated ADASYN, VAE, and early WGAN experiments - not maintained
-- **EDA V1:** Still functional but superseded by V2 for comprehensive analysis
-- **CPU-Only:** Configured for CPU processing (GAN models force `cuda=False`)
-- **Language:** Survey data must be in Romanian for FirstProcessing translation
+**Core:**
+- pandas, numpy, scipy
+- scikit-learn, xgboost, lightgbm
+- imbalanced-learn (SMOTE)
+- pyyaml, joblib
 
----
+**Visualization:**
+- matplotlib, seaborn
 
-## 🛠️ Configuration Files
+**Testing:**
+- pytest, pytest-cov
 
-### `EDA/V2/config.py`
-- Feature grouping definitions
-- Columns to exclude from analysis
-- PCA variance threshold
-- Clustering K range
-- Plot DPI settings
-
-### `FirstProcessing/main.py` - CONFIG dict
-- Risk scoring weights
-- Multi-value column definitions
-
----
-
-## 📚 Dependencies Highlights
-
-- **Data Processing:** pandas, numpy, scipy
-- **Machine Learning:** scikit-learn, xgboost, imbalanced-learn
-- **Deep Learning:** torch (CPU), sdv (CTGAN)
-- **Visualization:** matplotlib, seaborn
-- **Utilities:** openpyxl, joblib, tkinter (file dialogs)
+**Optional (GANs):**
+- torch, sdv (CTGAN)
 
 See `requirements.txt` for complete list.
 
 ---
 
-## 🎯 Typical Usage Workflow
+## 📝 Changelog
 
-1. **Prepare Data:**
-   ```cmd
-   python -m FirstProcessing.main
-   ```
-   - Select raw survey CSV/Excel
-   - Outputs encoded dataset with risk scores
+### Sprint 2 (January 2026) - Controlled Synthetic Augmentation
+- Added `DataAugmentation/quality_gates.py` - 4 mandatory quality gates
+- Added `DataAugmentation/cluster_enrichment.py` - Cluster-aware generation
+- Added `augmentation_experiment.py` - Controlled augmentation testing
+- Added `tests/` - Comprehensive pytest suite
+- Added `pytest.ini` - Test configuration
+- Fixed Ridge/Lasso random_state compatibility
+- Updated all configs to use Risk_Score (not Behavior_Risk_Level)
 
-2. **Run Advanced EDA:**
-   ```cmd
-   python -m EDA.V2.mainEDA2
-   ```
-   - Select processed dataset
-   - Choose output directory
-   - Generates comprehensive analysis and plots
-
-3. **Optional - Augment Data:**
-   ```cmd
-   python -m DataAugmentation.CTGan_Augmentation
-   ```
-   - Select training dataset
-   - Define augmentation parameters
-   - Outputs balanced synthetic dataset
-
-4. **Optional - Train Models (V1):**
-   ```cmd
-   python -m EDA.V1.mainEDA
-   ```
-   - Select test and train datasets
-   - Evaluates model performance
+### Sprint 1 (January 2026) - Clean Baselines
+- Created `run_experiment.py` - Single reproducible entrypoint
+- Added FORBIDDEN_TARGETS blocking
+- Implemented Repeated K-Fold CV (5×10)
+- Created baseline configs for regression and classification
 
 ---
 
-## 📝 Output Files
+## ⚠️ Known Limitations
 
-### FirstProcessing
-- `encoded_data.csv` / `encoded_data.xlsx` - Processed dataset
-- `robust_scaler.pkl` - Saved scaler model
-
-### EDA V2
-- `plots/` directory with subdirectories per analysis type
-- `pca_loadings.csv` - Feature contributions to PCs
-- `pca_transformed.csv` - Dataset in PC space
-- `kmeans_clustered_dataset.csv` - K-Means assignments
-- `gmm_clustered_dataset.csv` - GMM assignments with probabilities
-- `cluster_comparison_means.csv` - Feature means per cluster
-- `clustering_summary.txt` - Metrics and statistics
-
-### Data Augmentation
-- `augmented_dataset_encoded.csv` / `.xlsx` - Synthetic dataset
-- `augmentation_metrics.json` - Quality metrics per iteration
+- **Old folder:** Contains deprecated experiments - DO NOT USE
+- **CPU-Only:** GANs configured for CPU (`cuda=False`)
+- **Language:** Raw survey data must be in Romanian for FirstProcessing
 
 ---
 
+## 🎯 Scientific Validity
+
+This project follows strict reproducibility principles:
+
+1. **Deterministic seeds** - numpy/sklearn/torch seeded everywhere
+2. **No circular labels** - Behavior_Risk_Level forbidden as target
+3. **Quality gates** - Synthetic data must prove utility before use
+4. **Repeated CV** - 50 evaluations (5 folds × 10 repeats) for stable metrics
+5. **Test coverage** - Automated tests verify reproducibility
+
+**Important:** If synthetic augmentation does not help, that result is reported as "not_useful" - this is **valid science**, not a failure.
 
