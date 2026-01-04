@@ -18,6 +18,9 @@ from FirstProcessing.file_operations import auto_adjust_column_width
 import warnings
 warnings.filterwarnings("ignore")
 
+# DEPRECATED: This class uses iterative dataset growth and 50/50 final balancing.
+# These practices cause experimental drift and non-reproducible results.
+# For reproducible experiments, use run_experiment.py with configs/*.yaml
 class WCGANAugmentation:
     def __init__(self, target_column="Behavior_Risk_Level", step_fraction=0.25, max_size=2000,
                  random_state=42, min_confidence=0.8, generation_buffer=1.5):
@@ -321,25 +324,18 @@ class WCGANAugmentation:
         return df_current, self.history
 
 
+# DEPRECATED: This script uses iterative augmentation which causes experimental drift.
+# Use run_experiment.py with configs/*.yaml for reproducible experiments.
+# The code below is disabled to prevent accidental use.
+
 if __name__ == "__main__":
-    print("Using device: CPU (forced)")
-    augmenter = WCGANAugmentation(
-        target_column="Behavior_Risk_Level",
-        step_fraction=0.25,
-        max_size=10000,
-        random_state=42,
-        min_confidence=0.8
-    )
-
-    df = load_data()
-    if df is not None:
-        df_aug, history = augmenter.augment_incrementally(df)
-
-        print("\nAugmentation Complete!")
-        print(f"Original distribution: {df[augmenter.target_column].value_counts().to_dict()}")
-        print(f"Augmented distribution: {df_aug[augmenter.target_column].value_counts().to_dict()}")
-        print(f"Total samples: {len(df_aug)}")
-
-        save_dir = select_save_directory()
-        if save_dir:
-            augmenter.save_results(df_aug, history, save_dir)
+    print("=" * 60)
+    print("DEPRECATED: This augmentation script is disabled.")
+    print("Reason: Iterative growth + 50/50 balancing causes experimental drift.")
+    print("")
+    print("Use instead:")
+    print("  python run_experiment.py --config configs/default.yaml")
+    print("=" * 60)
+    # Original code disabled:
+    # augmenter = WCGANAugmentation(...)
+    # df_aug, history = augmenter.augment_incrementally(df)

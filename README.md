@@ -10,7 +10,44 @@ This project implements a comprehensive data processing and analysis pipeline fo
 -  **Dimensionality Reduction** - PCA analysis for feature extraction
 -  **Clustering Analysis** - K-Means and GMM clustering for behavioral segmentation
 -  **Machine Learning Models** - Multiple classification algorithms for risk prediction
--  **Data Augmentation** - CTGAN, SMOTE-Tomek, and WGAN-based synthetic data generation
+-  **Reproducible Experiments** - Single entrypoint with YAML configs for consistent results
+
+---
+
+## ⚠️ IMPORTANT: Clean Baseline Rules
+
+**`Behavior_Risk_Level` is FORBIDDEN as a training target** (circular label derived from features).
+
+**Allowed Targets:**
+- **Primary:** `Risk_Score` → continuous regression
+- **Secondary:** `Save_Money_Yes` → binary classification
+
+---
+
+## 🚀 Quick Start - Clean Baselines
+
+```bash
+# Run regression baseline (Risk_Score target)
+python run_experiment.py --config configs/baseline_regression.yaml --dataset path/to/data.csv
+
+# Run classification baseline (Save_Money target)
+python run_experiment.py --config configs/baseline_classification.yaml --dataset path/to/data.csv
+
+# Run ALL baselines at once
+python run_experiment.py --all-baselines --dataset path/to/data.csv
+```
+
+### Output per Run
+Each run produces a folder in `runs/` containing:
+- `config.yaml` - Experiment configuration
+- `metrics.json` - All CV metrics (mean ± std)
+- `model.joblib` - Trained model
+- `cv_distribution.png` - Cross-validation score distribution
+
+### Validation Protocol
+- **Repeated K-Fold CV:** 5 folds × 10 repeats = 50 evaluations
+- **Regression metrics:** MAE, RMSE, Spearman correlation, R²
+- **Classification metrics:** Macro-F1, Accuracy, Precision, Recall
 
 ---
 
@@ -18,6 +55,14 @@ This project implements a comprehensive data processing and analysis pipeline fo
 
 ```
 Procesare Dataset/
+├── run_experiment.py         # MAIN ENTRYPOINT for reproducible experiments
+├── configs/                  # Experiment configurations
+│   ├── baseline_regression.yaml    # Risk_Score regression (PRIMARY)
+│   ├── baseline_classification.yaml # Save_Money classification (SECONDARY)
+│   ├── default.yaml                 # Legacy config
+│   └── smote_experiment.yaml        # SMOTE augmentation config
+├── runs/                     # Output folder for experiment runs
+│
 ├── FirstProcessing/          # Initial data processing pipeline
 │   ├── main.py               # Entry point for data preprocessing
 │   ├── preprocessing.py      # Data normalization and translation (RO→EN)
@@ -49,6 +94,8 @@ Procesare Dataset/
 │           ├── cluster_comparison.py     # Cluster method comparison
 │           └── cluster_visualizer.py     # Cluster visualization
 │
+├── DataAugmentation/         # DEPRECATED - use run_experiment.py instead
+│   └── (legacy augmentation scripts)
 ├── DataAugmentation/         # Synthetic data generation
 │   ├── base.py               # Base augmentation class
 │   ├── CTGan_Augmentation.py # Conditional GAN augmentation

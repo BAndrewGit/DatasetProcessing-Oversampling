@@ -1,0 +1,61 @@
+# Clean baseline configuration - Save_Money classification
+# Secondary target: Save_Money_Yes vs Save_Money_No
+
+experiment:
+  name: "clean_baseline_classification"
+  seed: 42
+  output_dir: "runs"
+
+data:
+  dataset_path: null
+  test_size: 0.2
+  # SECONDARY TARGET - Save_Money binary classification
+  target_column: "Save_Money_Yes"
+  target_type: "classification"
+
+preprocessing:
+  # MANDATORY: Behavior_Risk_Level is IGNORED (not dropped, just never used)
+  ignored_columns:
+    - "Behavior_Risk_Level"
+    - "Risk_Score"
+    - "Save_Money_No"
+  # Columns to drop (auxiliary/derived)
+  columns_to_drop:
+    - "Confidence"
+    - "Outlier"
+    - "Cluster"
+    - "Auto_Label"
+
+augmentation:
+  # NO augmentation for baseline
+  enabled: false
+
+model:
+  type: "logistic_regression"
+  params:
+    logistic_regression:
+      class_weight: "balanced"
+      solver: "lbfgs"
+      max_iter: 2000
+    random_forest:
+      n_estimators: 150
+      class_weight: "balanced"
+    xgboost_clf:
+      n_estimators: 100
+      max_depth: 6
+      scale_pos_weight: 1.0
+
+cross_validation:
+  enabled: true
+  n_splits: 5
+  n_repeats: 10
+  shuffle: true
+
+metrics:
+  classification:
+    - "macro_f1"
+    - "accuracy"
+    - "precision"
+    - "recall"
+  save_plots: true
+

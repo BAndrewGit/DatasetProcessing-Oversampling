@@ -1,3 +1,7 @@
+# DEPRECATED: This script is in the Old/ folder and should not be used.
+# It causes experimental drift due to iterative augmentation practices.
+# For reproducible experiments, use run_experiment.py with configs/*.yaml
+
 import os
 import pandas as pd
 import numpy as np

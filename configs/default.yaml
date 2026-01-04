@@ -1,0 +1,75 @@
+# Default experiment configuration
+# Reproducible settings - re-running with same config yields consistent metrics
+
+experiment:
+  name: "baseline"
+  seed: 42
+  output_dir: "runs"
+
+data:
+  # Path to encoded dataset CSV
+  dataset_path: null  # Set via CLI or override
+  # PRIMARY TARGET - Risk_Score (regression)
+  # FORBIDDEN: Behavior_Risk_Level (circular label)
+  target_column: "Risk_Score"
+  target_type: "regression"
+  test_size: 0.2
+
+preprocessing:
+  # MANDATORY: Behavior_Risk_Level is IGNORED (not used in training)
+  ignored_columns:
+    - "Behavior_Risk_Level"
+  # Columns to drop before training
+  columns_to_drop:
+    - "Confidence"
+    - "Outlier"
+    - "Cluster"
+    - "Auto_Label"
+  scale_numeric: true
+
+augmentation:
+  # Augmentation is OFF by default for reproducibility
+  enabled: false
+  method: null  # Options: "smote", "smote_tomek", "ctgan", "wcgan"
+  # When enabled, use single-pass augmentation (no iterative growth)
+  single_pass: true
+  target_ratio: 1.0  # Ratio of minority to majority class (1.0 = balanced)
+
+model:
+  type: "logistic_regression"  # Options: logistic_regression, random_forest, xgboost, svm
+  # Model-specific parameters
+  params:
+    logistic_regression:
+      class_weight: "balanced"
+      solver: "newton-cg"
+      max_iter: 2000
+    random_forest:
+      n_estimators: 150
+      class_weight: "balanced"
+    xgboost:
+      n_estimators: 100
+      eval_metric: "logloss"
+    svm:
+      kernel: "linear"
+      class_weight: "balanced"
+
+cross_validation:
+  enabled: true
+  n_splits: 5
+  shuffle: true
+  stratified: true
+
+metrics:
+  # Metrics to compute
+  compute:
+    - "f1_weighted"
+    - "f1_macro"
+    - "accuracy"
+    - "roc_auc"
+    - "precision"
+    - "recall"
+  # Save confusion matrix plot
+  save_confusion_matrix: true
+  # Save ROC curve plot
+  save_roc_curve: true
+

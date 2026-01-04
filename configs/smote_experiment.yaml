@@ -1,0 +1,50 @@
+# SMOTE-Tomek augmentation experiment
+# Single-pass augmentation for reproducibility
+
+experiment:
+  name: "smote_tomek_baseline"
+  seed: 42
+  output_dir: "runs"
+
+data:
+  dataset_path: null
+  target_column: "Behavior_Risk_Level"
+  test_size: 0.2
+
+preprocessing:
+  columns_to_drop:
+    - "Risk_Score"
+    - "Confidence"
+    - "Outlier"
+    - "Cluster"
+    - "Auto_Label"
+  scale_numeric: true
+
+augmentation:
+  enabled: true
+  method: "smote_tomek"
+  single_pass: true
+  target_ratio: 1.0
+
+model:
+  type: "random_forest"
+  params:
+    random_forest:
+      n_estimators: 150
+      class_weight: "balanced"
+
+cross_validation:
+  enabled: true
+  n_splits: 5
+  shuffle: true
+  stratified: true
+
+metrics:
+  compute:
+    - "f1_weighted"
+    - "f1_macro"
+    - "accuracy"
+    - "roc_auc"
+  save_confusion_matrix: true
+  save_roc_curve: true
+

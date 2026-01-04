@@ -24,9 +24,30 @@ except ImportError:
     from DataAugmentation.base import BaseAugmentation
 
 
+# DEPRECATED: This class uses iterative two-phase augmentation.
+# This causes experimental drift and non-reproducible results.
+# For reproducible experiments, use run_experiment.py with configs/*.yaml
+#
+# HARD REMOVALS (enforced):
+# - NO retrain loops on enriched data
+# - NO exponential dataset growth
+# - NO final 50/50 balancing
+# - NO GAN retraining on synthetic output
+#
+# Use augmentation_experiment.py for controlled synthetic testing with quality gates.
+
 class SMOTETomekAugmentation(BaseAugmentation):
+    # DEPRECATED - Do not use in new experiments
+    # Use augmentation_experiment.py instead
 
     def __init__(self, target_column="Behavior_Risk_Level", random_state=42, step_fraction=0.2):
+        import warnings
+        warnings.warn(
+            "SMOTETomekAugmentation is DEPRECATED. "
+            "Use augmentation_experiment.py with quality gates instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         super().__init__(target_column=target_column)
         self.random_state = random_state
         self.step_fraction = step_fraction
@@ -427,60 +448,15 @@ class SMOTETomekAugmentation(BaseAugmentation):
         return X_aug, y_relabeled
 
 
+# DEPRECATED: This script uses iterative augmentation which causes experimental drift.
+# Use run_experiment.py with configs/*.yaml for reproducible experiments.
+
 if __name__ == "__main__":
-    # Get user choice and convert to boolean immediately
-    choice = input("Do you want to save only synthetic samples? (Y/N): ").strip()
-    SAVE_SYNTHETIC_ONLY = choice.lower() == 'y'
-
-    # Create the augmenter instance
-    augmenter = SMOTETomekAugmentation(target_column="Behavior_Risk_Level", random_state=42)
-
-    # Load the original dataset
-    df = augmenter.load_dataset()
-
-    if df is not None:
-        try:
-            # Perform the augmentation
-            X_aug, y_aug, history = augmenter.augment(df)
-
-            if X_aug is not None and y_aug is not None:
-                # Combine augmented features and target into a single DataFrame
-                df_aug = pd.concat([X_aug, pd.Series(y_aug, name=augmenter.target_column)], axis=1)
-
-                if SAVE_SYNTHETIC_ONLY:
-                    from pandas.util import hash_pandas_object
-
-                    columns_to_ignore = ["Risk_Score", "Outlier", "Cluster", "Auto_Label", "Confidence"]
-                    df_filtered = df.drop(columns=columns_to_ignore + [augmenter.target_column], errors='ignore')
-                    df_aug_filtered = df_aug.drop(columns=columns_to_ignore + [augmenter.target_column], errors='ignore')
-                    # Hash original data rows (excluding target column)
-                    original_hashes = set(hash_pandas_object(df_filtered, index=False))
-                    augmented_hashes = hash_pandas_object(df_aug_filtered, index=False)
-
-                    # Identify which rows are synthetic
-                    df_aug["is_original"] = augmented_hashes.isin(original_hashes)
-                    df_aug = df_aug[~df_aug["is_original"]].drop(columns=["is_original"])
-                    print(f"Saved only synthetic samples: {len(df_aug)} instances")
-                else:
-                    print("\nSaving full augmented dataset including original + synthetic")
-
-                # Summary
-                print("\nAugmentation Complete!")
-                print(f"Original class distribution: {df[augmenter.target_column].value_counts().to_dict()}")
-                print(f"Augmented class distribution: {df_aug[augmenter.target_column].value_counts().to_dict()}")
-                print(f"Total samples: {len(df_aug)}")
-
-                # Choose save location and export
-                try:
-                    save_dir = select_save_directory()
-                    if save_dir:
-                        augmenter.save_results(
-                            df_aug.drop(columns=[augmenter.target_column]),
-                            df_aug[augmenter.target_column],
-                            history,
-                            save_dir=save_dir
-                        )
-                except Exception as e:
-                    print(f"Error during save: {e}")
-        except Exception as e:
-            print(f"Error during augmentation: {e}")
+    print("=" * 60)
+    print("DEPRECATED: This augmentation script is disabled.")
+    print("Reason: Iterative phase-based augmentation causes experimental drift.")
+    print("")
+    print("Use instead:")
+    print("  python run_experiment.py --config configs/smote_experiment.yaml")
+    print("=" * 60)
+    # Original code disabled - use run_experiment.py instead

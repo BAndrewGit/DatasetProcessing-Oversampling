@@ -1,0 +1,60 @@
+# Clean baseline configuration - NO circular binary labels
+# Primary: Risk_Score (regression), Secondary: Save_Money (classification)
+
+experiment:
+  name: "clean_baseline_regression"
+  seed: 42
+  output_dir: "runs"
+
+data:
+  dataset_path: null
+  test_size: 0.2
+  # PRIMARY TARGET - Risk_Score regression
+  target_column: "Risk_Score"
+  target_type: "regression"
+
+preprocessing:
+  # MANDATORY: Behavior_Risk_Level is IGNORED (not dropped, just never used)
+  ignored_columns:
+    - "Behavior_Risk_Level"
+  # Columns to drop (auxiliary/derived)
+  columns_to_drop:
+    - "Confidence"
+    - "Outlier"
+    - "Cluster"
+    - "Auto_Label"
+
+augmentation:
+  # NO augmentation for baseline
+  enabled: false
+
+model:
+  type: "ridge"
+  params:
+    ridge:
+      alpha: 1.0
+    lasso:
+      alpha: 0.1
+    xgboost_reg:
+      n_estimators: 100
+      max_depth: 6
+      learning_rate: 0.1
+    lightgbm_reg:
+      n_estimators: 100
+      max_depth: 6
+      learning_rate: 0.1
+
+cross_validation:
+  enabled: true
+  n_splits: 5
+  n_repeats: 10
+  shuffle: true
+
+metrics:
+  regression:
+    - "mae"
+    - "rmse"
+    - "spearman"
+    - "r2"
+  save_plots: true
+
