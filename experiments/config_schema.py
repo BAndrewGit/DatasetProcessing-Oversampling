@@ -43,7 +43,7 @@ def validate_config(config, mode='baseline'):
 
     Args:
         config: dict - Configuration dictionary
-        mode: str - 'baseline' or 'augmentation'
+        mode: str - 'baseline', 'augmentation', or 'multitask'
 
     Raises:
         ConfigValidationError if validation fails
@@ -55,6 +55,17 @@ def validate_config(config, mode='baseline'):
         if section not in config:
             errors.append(f"Missing required section: '{section}'")
             continue
+
+        # Skip target validation for multitask mode
+        if mode == 'multitask' and section == 'data':
+            # Multitask doesn't use target_column/target_type in config
+            continue
+
+        # Skip model.type requirement for multitask mode (uses neural network)
+        if mode == 'multitask' and section == 'model':
+            # Multitask uses hidden_dims instead of type
+            continue
+
         for key in required_keys:
             if key not in config[section]:
                 errors.append(f"Missing required key: '{section}.{key}'")
@@ -62,20 +73,22 @@ def validate_config(config, mode='baseline'):
     if errors:
         raise ConfigValidationError("Config validation failed:\n  - " + "\n  - ".join(errors))
 
-    # Validate target_type
-    target_type = config['data'].get('target_type')
-    if target_type not in ALLOWED_TARGET_TYPES:
-        errors.append(f"Invalid target_type '{target_type}'. Allowed: {ALLOWED_TARGET_TYPES}")
+    # Validate target_type (skip for multitask)
+    if mode != 'multitask':
+        target_type = config['data'].get('target_type')
+        if target_type not in ALLOWED_TARGET_TYPES:
+            errors.append(f"Invalid target_type '{target_type}'. Allowed: {ALLOWED_TARGET_TYPES}")
 
-    # Validate target is not forbidden
-    target = config['data'].get('target_column')
-    if target in FORBIDDEN_TARGETS:
-        errors.append(f"FORBIDDEN target '{target}'. Use 'Risk_Score' or 'Save_Money_Yes'.")
+        # Validate target is not forbidden
+        target = config['data'].get('target_column')
+        if target in FORBIDDEN_TARGETS:
+            errors.append(f"FORBIDDEN target '{target}'. Use 'Risk_Score' or 'Save_Money_Yes'.")
 
-    # Validate model type
-    model_type = config['model'].get('type')
-    if model_type not in ALLOWED_MODEL_TYPES:
-        errors.append(f"Invalid model type '{model_type}'. Allowed: {ALLOWED_MODEL_TYPES}")
+    # Validate model type (skip for multitask - uses neural network)
+    if mode != 'multitask':
+        model_type = config['model'].get('type')
+        if model_type not in ALLOWED_MODEL_TYPES:
+            errors.append(f"Invalid model type '{model_type}'. Allowed: {ALLOWED_MODEL_TYPES}")
 
     # Validate augmentation method if present
     aug_config = config.get('augmentation', {})

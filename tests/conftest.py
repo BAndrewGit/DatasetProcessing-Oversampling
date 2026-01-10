@@ -1,9 +1,13 @@
 import os
 import json
 import copy
+import sys
 import pytest
 import pandas as pd
 import numpy as np
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import from modular experiments package
 from experiments.config_schema import validate_config, validate_baseline_config, ConfigValidationError
@@ -13,7 +17,7 @@ from experiments.models import build_model
 from experiments.cv import run_repeated_cv_regression, run_repeated_cv_classification
 
 # Import baseline runner
-import run_baseline
+from runners import run_baseline
 
 
 @pytest.fixture(scope="session")
@@ -137,7 +141,7 @@ def patch_dataset_loader(monkeypatch, tiny_adv_df):
         return tiny_adv_df.copy(), "test_dataset.csv"
 
     monkeypatch.setattr("experiments.data.load_dataset", _fake_load_dataset)
-    monkeypatch.setattr("run_baseline.load_dataset", _fake_load_dataset)
+    monkeypatch.setattr("runners.run_baseline.load_dataset", _fake_load_dataset)
     return _fake_load_dataset
 
 

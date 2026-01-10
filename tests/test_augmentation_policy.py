@@ -1,5 +1,11 @@
 import copy
 import pytest
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from experiments.config_schema import validate_baseline_config, ConfigValidationError
 
 
@@ -26,7 +32,7 @@ def test_baseline_runner_requires_augmentation_disabled(
 
     cfg_path = write_yaml(cfg, "aug_enabled.yaml")
 
-    import run_baseline
+    from runners import run_baseline
     with pytest.raises(ConfigValidationError, match="Augmentation is enabled"):
         run_baseline.run_baseline(cfg_path, dataset_path="IGNORED.csv")
 
@@ -42,7 +48,7 @@ def test_baseline_with_disabled_augmentation_succeeds(
 
     cfg_path = write_yaml(cfg, "baseline_correct.yaml")
 
-    import run_baseline
+    from runners import run_baseline
     run_dir = run_baseline.run_baseline(cfg_path, dataset_path="IGNORED.csv")
 
     import os
