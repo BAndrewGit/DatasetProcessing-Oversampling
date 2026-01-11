@@ -84,11 +84,15 @@ def generate_ablation_table(
                 metric_key = [k for k, v in metric_names.items() if v == col]
                 if metric_key:
                     metric_key = metric_key[0]
-                    if any(x in metric_key.lower() for x in ['mae', 'rmse', 'error', 'loss']):
-                        best_idx = np.nanargmin(values)
-                    else:
-                        best_idx = np.nanargmax(values)
-                    best_values[col] = best_idx
+                    try:
+                        if any(x in metric_key.lower() for x in ['mae', 'rmse', 'error', 'loss']):
+                            best_idx = np.nanargmin(values)
+                        else:
+                            best_idx = np.nanargmax(values)
+                        best_values[col] = best_idx
+                    except ValueError:
+                        # All-NaN slice - skip highlighting
+                        pass
 
     # Format output
     if format_type == 'latex':

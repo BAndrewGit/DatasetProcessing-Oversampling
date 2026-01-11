@@ -2,7 +2,7 @@ import json
 import os
 import copy
 import numpy as np
-import run_baseline
+from runners import run_baseline
 
 
 def _load_metrics(run_dir):

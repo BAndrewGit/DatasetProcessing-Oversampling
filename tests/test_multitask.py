@@ -27,7 +27,7 @@ def test_multitask_model_forward_pass():
 
 def test_multitask_blocks_forbidden_target():
     """Test that Behavior_Risk_Level is excluded from features."""
-    from run_multitask_experiment import preprocess_multitask_data
+    from runners.run_multitask_experiment import preprocess_multitask_data
 
     # Create dummy dataset with forbidden column
     df = pd.DataFrame({
@@ -58,7 +58,7 @@ def test_multitask_blocks_forbidden_target():
 
 def test_multitask_requires_both_classes():
     """Test that multitask aborts if Save_Money_Yes has only one class."""
-    from run_multitask_experiment import preprocess_multitask_data
+    from runners.run_multitask_experiment import preprocess_multitask_data
 
     # Create dataset with only one class
     df = pd.DataFrame({
@@ -80,7 +80,7 @@ def test_multitask_requires_both_classes():
 
 def test_multitask_mutual_exclusivity():
     """Test that Save_Money_Yes and Save_Money_No are mutually exclusive."""
-    from run_multitask_experiment import preprocess_multitask_data
+    from runners.run_multitask_experiment import preprocess_multitask_data
 
     # Create dataset with both columns = 1 (invalid)
     df = pd.DataFrame({

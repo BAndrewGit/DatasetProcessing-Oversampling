@@ -11,6 +11,13 @@ from sklearn.decomposition import PCA
 from scipy import stats
 
 
+def _to_numpy(arr):
+    # Convert DataFrame/Series to numpy array if needed
+    if hasattr(arr, 'values'):
+        return arr.values
+    return np.asarray(arr)
+
+
 def analyze_errors_by_segment(
     y_true: np.ndarray,
     y_pred: np.ndarray,
@@ -109,20 +116,12 @@ def identify_failure_cases(
 ) -> Tuple[pd.DataFrame, Dict]:
     """
     Identify and characterize systematic failure cases.
-
-    Args:
-        y_true: True target values
-        y_pred: Predicted values
-        X: Feature matrix
-        feature_names: Feature names
-        task_type: 'regression' or 'classification'
-        threshold_percentile: Percentile for defining failures
-        n_cases: Number of failure cases to return
-
-    Returns:
-        failure_cases: DataFrame with failure case details
-        failure_patterns: Dict with identified patterns
     """
+    # Convert to numpy arrays
+    y_true = _to_numpy(y_true)
+    y_pred = _to_numpy(y_pred)
+    X = _to_numpy(X)
+
     if task_type == 'regression':
         errors = np.abs(y_true - y_pred)
         threshold = np.percentile(errors, threshold_percentile)

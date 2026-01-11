@@ -51,7 +51,143 @@ def check_nan_values(df):
         print(f"\nFirst 5 rows with NaN in column '{col}':")
         print(nan_rows.head(5))
 
-# Full pipeline: load, clean, encode, score, export
+def process_dataset(input_path: str, output_dir: str = "data/processed", output_prefix: str = "1") -> str | None:
+    """
+    Procesează dataset-ul programatic (fără dialoguri).
+
+    Args:
+        input_path: Calea către fișierul CSV brut
+        output_dir: Directorul unde se salvează rezultatele
+        output_prefix: Prefixul pentru fișierele de output
+
+    Returns:
+        Calea către fișierul CSV encodat sau None dacă a eșuat
+    """
+    from pathlib import Path
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        print(f"Loading file: {input_path}")
+        df_raw = pd.read_csv(input_path, sep=",", quotechar='"', engine="python")
+
+        print("\n>>> Normalizing and translating data...")
+        df_norm = normalize_and_translate_data(df_raw)
+
+        # Lifetime columns to smooth
+        lifetime_cols = [
+            "Product_Lifetime_Clothing", "Product_Lifetime_Tech",
+            "Product_Lifetime_Appliances", "Product_Lifetime_Cars"
+        ]
+
+        # Decoded version (text-based)
+        df_decoded = df_norm.copy()
+        for col in multi_value_cols:
+            if col not in df_decoded.columns:
+                if col in df_norm.columns:
+                    df_decoded[col] = df_norm[col]
+                else:
+                    df_decoded[col] = pd.NA
+
+        df_decoded = range_smoothing(
+            df_decoded,
+            age_column="Age",
+            income_column="Income_Category",
+            lifetime_columns=lifetime_cols,
+            essential_needs_column="Essential_Needs_Percentage",
+            lifetime_func=random_product_lifetime
+        )
+
+        # Reorder decoded columns
+        desired_column_order = [
+            'Age', 'Family_Status', 'Gender', 'Income_Category', 'Essential_Needs_Percentage',
+            'Financial_Attitude', 'Budget_Planning', 'Save_Money', 'Savings_Goal', 'Savings_Obstacle',
+            'Expense_Distribution', 'Product_Lifetime_Clothing', 'Product_Lifetime_Tech',
+            'Product_Lifetime_Appliances', 'Product_Lifetime_Cars', 'Impulse_Buying_Frequency',
+            'Impulse_Buying_Category', 'Impulse_Buying_Reason', 'Credit_Usage', 'Debt_Level',
+            'Financial_Investments', 'Bank_Account_Analysis_Frequency', 'Behavior_Risk_Level'
+        ]
+        df_decoded = df_decoded[[col for col in desired_column_order if col in df_decoded.columns]]
+
+        # Encoded version (for scoring)
+        df_encoded = df_norm.copy()
+        df_encoded.drop(columns=multi_value_cols, inplace=True, errors='ignore')
+        df_encoded.rename(columns=lambda x: x.replace('_encoded', ''), inplace=True)
+
+        df_encoded = range_smoothing(
+            df_encoded,
+            age_column="Age",
+            income_column="Income_Category",
+            lifetime_columns=lifetime_cols,
+            essential_needs_column="Essential_Needs_Percentage",
+            lifetime_func=lambda x: random_product_lifetime(x, encoded=True)
+        )
+
+        print("\n>>> Post-processing data (encoded version)...")
+        df_encoded = postprocess_data(df_encoded)
+        if df_encoded is None:
+            return None
+
+        # Normalize numeric columns
+        numeric_cols_to_scale = [
+            'Age', 'Income_Category', 'Essential_Needs_Percentage',
+            'Product_Lifetime_Clothing', 'Product_Lifetime_Tech',
+            'Product_Lifetime_Appliances', 'Product_Lifetime_Cars'
+        ]
+        scaler_path = Path("scaler/robust_scaler.pkl")
+        scaler_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Flag: True rewrite scaler
+        RETRAIN_SCALER = True
+
+        if RETRAIN_SCALER:
+            df_encoded = fit_and_save_scaler(df_encoded, numeric_cols_to_scale, scaler_path)
+        else:
+            df_encoded = apply_existing_scaler(df_encoded, numeric_cols_to_scale, scaler_path)
+
+        print("\n>>> Calculating risk score...")
+        df_encoded = calculate_risk_advanced(df_encoded)
+        if df_encoded is None:
+            return None
+
+        print("\nRisk distribution:")
+        print(df_encoded['Behavior_Risk_Level'].value_counts(dropna=False))
+        if len(df_encoded['Behavior_Risk_Level'].unique()) == 1:
+            print("\nNot enough risk variation for analysis!")
+            return None
+
+        # Transfer risk label to decoded version
+        df_decoded['Behavior_Risk_Level'] = df_encoded['Behavior_Risk_Level'].apply(
+            lambda x: "Risky" if x == 1 else "Beneficial"
+        )
+
+        # Save files automatically
+        auxiliary_cols = ['Confidence', 'Cluster', 'Auto_Label', 'Outlier']
+        df_encoded_export = df_encoded.drop(columns=auxiliary_cols, errors='ignore')
+
+        # Save decoded Excel
+        excel_save_path = os.path.join(output_dir, f"{output_prefix}_decoded.xlsx")
+        with pd.ExcelWriter(excel_save_path, engine='openpyxl') as writer:
+            df_decoded.to_excel(writer, index=False, sheet_name='Decoded_Data')
+            auto_adjust_column_width(writer, 'Decoded_Data')
+        print(f"✓ Decoded Excel saved: {excel_save_path}")
+
+        # Save encoded CSV
+        csv_save_path = os.path.join(output_dir, f"{output_prefix}_encoded.csv")
+        df_encoded_export.to_csv(csv_save_path, index=False, encoding='utf-8')
+        print(f"✓ Encoded CSV saved: {csv_save_path}")
+
+        print("\n✓ Processing complete!")
+        return csv_save_path
+
+    except Exception as e:
+        print(f"An error occurred during processing: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+# Full pipeline: load, clean, encode, score, export (versiunea interactivă cu dialog)
 def main():
     Tk().withdraw()
 

@@ -1,7 +1,7 @@
 import os
 import json
 import yaml
-import run_baseline
+from runners import run_baseline
 
 
 def test_run_creates_required_artifacts(

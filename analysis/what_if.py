@@ -10,6 +10,13 @@ from sklearn.inspection import partial_dependence
 import warnings
 
 
+def _to_numpy(arr):
+    # Convert DataFrame/Series to numpy array if needed
+    if hasattr(arr, 'values'):
+        return arr.values
+    return np.asarray(arr)
+
+
 def compute_partial_dependence(
     model,
     X: np.ndarray,
@@ -20,18 +27,8 @@ def compute_partial_dependence(
 ) -> Dict:
     """
     Compute partial dependence for selected features.
-
-    Args:
-        model: Trained model with predict method
-        X: Feature matrix
-        feature_indices: Indices of features to analyze
-        feature_names: Feature names
-        grid_resolution: Number of grid points
-        percentiles: Percentile range for feature values
-
-    Returns:
-        Dict with partial dependence results
     """
+    X = _to_numpy(X)
     results = {}
 
     for feat_idx in feature_indices:
@@ -150,18 +147,9 @@ def sensitivity_analysis(
 ) -> pd.DataFrame:
     """
     Perform sensitivity analysis by perturbing each feature.
-
-    Args:
-        model: Trained model or None if predict_fn provided
-        X_baseline: Baseline feature vector(s)
-        feature_names: Feature names
-        perturbation_range: Range of perturbation as fraction of std
-        n_steps: Number of perturbation steps
-        predict_fn: Optional custom prediction function
-
-    Returns:
-        DataFrame with sensitivity results
     """
+    X_baseline = _to_numpy(X_baseline)
+
     if X_baseline.ndim == 1:
         X_baseline = X_baseline.reshape(1, -1)
 

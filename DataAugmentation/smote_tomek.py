@@ -10,9 +10,14 @@ from sklearn.feature_selection import f_classif
 from sklearn.linear_model import LogisticRegression
 from scipy.spatial.distance import cosine
 from scipy.stats import f_oneway
-from EDA import select_save_directory
 from sklearn.preprocessing import StandardScaler
 import warnings
+
+# Optional import - only used in deprecated interactive code
+try:
+    from EDA import select_save_directory
+except ImportError:
+    select_save_directory = None
 
 try:
     from DataAugmentation.base import BaseAugmentation

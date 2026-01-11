@@ -201,7 +201,6 @@ class MultiTaskTrainer:
                 patience_counter += 1
 
             if patience_counter >= self.patience:
-                print(f"Early stopping at epoch {epoch+1}")
                 break
 
         return best_metrics
