@@ -41,7 +41,7 @@ except ImportError:
 
 from DataAugmentation.quality_gates import SyntheticQualityGates, validate_synthetic_ratio
 from experiments.config_schema import validate_augmentation_config, ConfigValidationError, FORBIDDEN_TARGETS
-from experiments.io import load_config, save_data_profile, dataset_hash
+from experiments.io import load_config
 from experiments.data import load_dataset, validate_save_money_consistency
 
 
@@ -134,8 +134,25 @@ def generate_cluster_synthetic(X_train, y_train, target_type='regression', ratio
         return None, None
 
 
-def run_augmentation_experiment(config_path, dataset_path=None):
+def generate_synthetic_data(X, y, ratio, method, seed):
+    # Unified synthetic data generation interface
+    if method == 'jitter':
+        return generate_synthetic_regression(X, y, ratio, seed)
+    elif method == 'smote':
+        return generate_synthetic_smote(X, y, ratio, seed)
+    elif method == 'cluster':
+        return generate_cluster_synthetic(X, y, 'regression', ratio, seed)
+    else:
+        return generate_synthetic_regression(X, y, ratio, seed)
+
+
+def run_augmentation_experiment(config_path, dataset_path=None, output_dir=None,
+                                 save_augmented_data=False, augmented_data_dir=None):
     config = load_config(config_path)
+
+    # Override output_dir if provided
+    if output_dir:
+        config['experiment']['output_dir'] = output_dir
 
     # Validate config for augmentation mode
     try:
@@ -233,31 +250,35 @@ def run_augmentation_experiment(config_path, dataset_path=None):
         scaler = StandardScaler()
         X_train_s = scaler.fit_transform(X_train)
         X_test_s = scaler.transform(X_test)
+        # Convert scaled arrays into DataFrames with column names so sklearn estimators keep feature names
+        feature_cols = feature_cols if 'feature_cols' in locals() else [f'f{i}' for i in range(X.shape[1])]
+        X_train_s_df = pd.DataFrame(X_train_s, columns=feature_cols)
+        X_test_s_df = pd.DataFrame(X_test_s, columns=feature_cols)
 
         # Real-only baseline
         if target_type == 'regression':
             model_real = Ridge(random_state=seed)
-            model_real.fit(X_train_s, y_train)
-            pred_real = model_real.predict(X_test_s)
+            model_real.fit(X_train_s_df, y_train)
+            pred_real = model_real.predict(X_test_s_df)
 
             results_real_only['mae'].append(mean_absolute_error(y_test, pred_real))
             results_real_only['rmse'].append(np.sqrt(mean_squared_error(y_test, pred_real)))
             results_real_only['spearman'].append(spearmanr(y_test, pred_real)[0])
         else:
             model_real = LogisticRegression(class_weight='balanced', random_state=seed, max_iter=1000)
-            model_real.fit(X_train_s, y_train)
-            pred_real = model_real.predict(X_test_s)
+            model_real.fit(X_train_s_df, y_train)
+            pred_real = model_real.predict(X_test_s_df)
 
             results_real_only['f1'].append(f1_score(y_test, pred_real, average='macro'))
             results_real_only['acc'].append(accuracy_score(y_test, pred_real))
 
         # Generate synthetic data INSIDE this fold
         if synthetic_method == 'cluster':
-            X_syn, y_syn = generate_cluster_synthetic(X_train_s, y_train, target_type, ratio=synthetic_ratio, seed=seed + fold_idx)
+            X_syn, y_syn = generate_cluster_synthetic(X_train_s_df.values, y_train, target_type, ratio=synthetic_ratio, seed=seed + fold_idx)
         elif target_type == 'regression' or synthetic_method == 'jitter':
-            X_syn, y_syn = generate_synthetic_regression(X_train_s, y_train, ratio=synthetic_ratio, seed=seed + fold_idx)
+            X_syn, y_syn = generate_synthetic_regression(X_train_s_df.values, y_train, ratio=synthetic_ratio, seed=seed + fold_idx)
         else:
-            X_syn, y_syn = generate_synthetic_smote(X_train_s, y_train, ratio=synthetic_ratio, seed=seed + fold_idx)
+            X_syn, y_syn = generate_synthetic_smote(X_train_s_df.values, y_train, ratio=synthetic_ratio, seed=seed + fold_idx)
 
         if X_syn is None or len(X_syn) == 0:
             # No synthetic data generated - use real-only results
@@ -287,19 +308,22 @@ def run_augmentation_experiment(config_path, dataset_path=None):
             # Use augmented training
             X_train_aug = np.vstack([X_train_s, X_syn])
             y_train_aug = np.concatenate([y_train, y_syn])
+            # Convert to DataFrame with feature names so sklearn models retain feature_names_in_
+            X_train_aug_df = pd.DataFrame(X_train_aug, columns=feature_cols)
 
             if target_type == 'regression':
                 model_aug = Ridge(random_state=seed)
-                model_aug.fit(X_train_aug, y_train_aug)
-                pred_aug = model_aug.predict(X_test_s)
+                model_aug.fit(X_train_aug_df, y_train_aug)
+                pred_aug = model_aug.predict(X_test_s_df)
 
                 results_augmented['mae'].append(mean_absolute_error(y_test, pred_aug))
                 results_augmented['rmse'].append(np.sqrt(mean_squared_error(y_test, pred_aug)))
                 results_augmented['spearman'].append(spearmanr(y_test, pred_aug)[0])
             else:
                 model_aug = LogisticRegression(class_weight='balanced', random_state=seed, max_iter=1000)
-                model_aug.fit(X_train_aug, y_train_aug)
-                pred_aug = model_aug.predict(X_test_s)
+                # X_train_aug_df already created above
+                model_aug.fit(X_train_aug_df, y_train_aug)
+                pred_aug = model_aug.predict(X_test_s_df)
 
                 results_augmented['f1'].append(f1_score(y_test, pred_aug, average='macro'))
                 results_augmented['acc'].append(accuracy_score(y_test, pred_aug))
@@ -338,14 +362,26 @@ def run_augmentation_experiment(config_path, dataset_path=None):
 
             print(f"{metric.upper():<15} {real_mean:.4f} ± {real_std:.4f}    {aug_mean:.4f} ± {aug_std:.4f}")
 
-        # Decision
-        mae_real = np.mean(results_real_only['mae'])
-        mae_aug = np.mean(results_augmented['mae'])
-        improvement = (mae_real - mae_aug) / mae_real * 100
+        # Decision - robust calculations (avoid division by zero)
+        def _safe_mean(arr):
+            try:
+                return float(np.mean(arr))
+            except Exception:
+                return 0.0
 
-        std_real = np.std(results_real_only['mae'])
-        std_aug = np.std(results_augmented['mae'])
-        stability_change = (std_real - std_aug) / std_real * 100 if std_real > 0 else 0
+        def _safe_std(arr):
+            try:
+                return float(np.std(arr))
+            except Exception:
+                return 0.0
+
+        mae_real = _safe_mean(results_real_only['mae'])
+        mae_aug = _safe_mean(results_augmented['mae'])
+        std_real = _safe_std(results_real_only['mae'])
+        std_aug = _safe_std(results_augmented['mae'])
+
+        improvement = ((mae_real - mae_aug) / mae_real * 100) if mae_real != 0 else 0.0
+        stability_change = ((std_real - std_aug) / std_real * 100) if std_real != 0 else 0.0
     else:
         print("\nCLASSIFICATION METRICS:")
         print("-" * 50)
@@ -360,14 +396,13 @@ def run_augmentation_experiment(config_path, dataset_path=None):
 
             print(f"{metric.upper():<15} {real_mean:.4f} ± {real_std:.4f}    {aug_mean:.4f} ± {aug_std:.4f}")
 
-        # Decision
-        f1_real = np.mean(results_real_only['f1'])
-        f1_aug = np.mean(results_augmented['f1'])
-        improvement = (f1_aug - f1_real) / f1_real * 100
-
-        std_real = np.std(results_real_only['f1'])
-        std_aug = np.std(results_augmented['f1'])
-        stability_change = (std_real - std_aug) / std_real * 100 if std_real > 0 else 0
+        # Decision - robust calculations (avoid division by zero)
+        f1_real = _safe_mean(results_real_only['f1'])
+        f1_aug = _safe_mean(results_augmented['f1'])
+        std_real = _safe_std(results_real_only['f1'])
+        std_aug = _safe_std(results_augmented['f1'])
+        improvement = ((f1_aug - f1_real) / f1_real * 100) if f1_real != 0 else 0.0
+        stability_change = ((std_real - std_aug) / std_real * 100) if std_real != 0 else 0.0
 
     print("\n" + "=" * 70)
     print("DECISION")
@@ -394,8 +429,8 @@ def run_augmentation_experiment(config_path, dataset_path=None):
 
     # Save results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = config['experiment'].get('output_dir', 'runs')
-    run_dir = os.path.join(output_dir, f"augmentation_experiment_{timestamp}")
+    exp_output_dir = config['experiment'].get('output_dir', 'runs')
+    run_dir = os.path.join(exp_output_dir, f"augmentation_experiment_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
 
     results_json = {
@@ -414,12 +449,114 @@ def run_augmentation_experiment(config_path, dataset_path=None):
         'verdict': verdict
     }
 
+    # --- NEW: Save standardized metrics and data profile for analysis tooling ---
+    metrics = {
+        'cv_results': {
+            'real_only': results_real_only,
+            'augmented': results_augmented
+        },
+        'quality_gate_results': quality_gate_results
+    }
+
+    data_profile = {
+        'features_used': feature_cols,
+        'n_features': len(feature_cols),
+        'ignored_columns': ignored
+    }
+
+    exp_output_dir = config['experiment'].get('output_dir', 'runs')
+    run_dir = os.path.join(exp_output_dir, f"augmentation_experiment_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Prepare serializable metrics
+    def _to_py(obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, (np.ndarray,)):
+            return obj.tolist()
+        if isinstance(obj, (list, tuple)):
+            return [_to_py(x) for x in obj]
+        if isinstance(obj, dict):
+            return {k: _to_py(v) for k, v in obj.items()}
+        try:
+            # fallback for numpy.bool_, etc.
+            return obj.item()
+        except Exception:
+            return obj
+
+    serializable_metrics = _to_py(metrics)
+    serializable_qg = _to_py(quality_gate_results)
+
+    # Save metrics.json
+    try:
+        with open(os.path.join(run_dir, 'metrics.json'), 'w') as f:
+            json.dump({'cv_results': serializable_metrics['cv_results'], 'quality_gate_results': serializable_qg}, f, indent=2)
+    except Exception as e:
+        print(f"Warning: failed to write metrics.json: {e}")
+
+    # Save data_profile.json
+    try:
+        with open(os.path.join(run_dir, 'data_profile.json'), 'w') as f:
+            json.dump(data_profile, f, indent=2)
+    except Exception as e:
+        print(f"Warning: failed to write data_profile.json: {e}")
+
+    # Save full results summary
     with open(os.path.join(run_dir, 'augmentation_results.json'), 'w') as f:
         json.dump(results_json, f, indent=2)
 
     # Save config
     with open(os.path.join(run_dir, 'config.yaml'), 'w') as f:
         yaml.dump(config, f, default_flow_style=False)
+
+    # Save augmented data if requested
+    if save_augmented_data and augmented_data_dir:
+        os.makedirs(augmented_data_dir, exist_ok=True)
+
+        # Generate one final augmented dataset for reference
+        X_syn, y_syn = generate_synthetic_data(X, y, synthetic_ratio, synthetic_method, seed)
+
+        if X_syn is not None and len(X_syn) > 0:
+            # Combine real + synthetic
+            X_combined = np.vstack([X, X_syn])
+            y_combined = np.concatenate([y, y_syn])
+
+            # Create DataFrame
+            df_augmented = pd.DataFrame(X_combined, columns=feature_cols)
+            df_augmented[target] = y_combined
+            df_augmented['is_synthetic'] = [False] * len(X) + [True] * len(X_syn)
+
+            # Save
+            aug_filename = f"augmented_{target}_{timestamp}.csv"
+            aug_path = os.path.join(augmented_data_dir, aug_filename)
+            df_augmented.to_csv(aug_path, index=False)
+            print(f"Augmented data saved to: {aug_path}")
+
+            results_json['augmented_data_path'] = aug_path
+
+    print(f"\nResults saved to: {run_dir}")
+
+    # --- NEW: train and save a representative model for analysis tooling ---
+    try:
+        from sklearn.pipeline import Pipeline
+        import joblib as _joblib
+
+        df_full = pd.DataFrame(X, columns=feature_cols)
+        if target_type == 'regression':
+            final_pipeline = Pipeline([('scaler', StandardScaler()), ('model', Ridge(random_state=seed))])
+            final_pipeline.fit(df_full, y)
+        else:
+            final_pipeline = Pipeline([('scaler', StandardScaler()), ('model', LogisticRegression(class_weight='balanced', max_iter=1000, random_state=seed))])
+            final_pipeline.fit(df_full, y)
+
+        _joblib.dump(final_pipeline, os.path.join(run_dir, 'model.joblib'))
+        # also save scaler separately for convenience
+        _joblib.dump(final_pipeline.named_steps['scaler'], os.path.join(run_dir, 'scaler.joblib'))
+        print(f"Saved representative model to: {os.path.join(run_dir, 'model.joblib')}")
+    except Exception as e:
+        print(f"Warning: failed to save representative model: {e}")
 
     print(f"\nResults saved to: {run_dir}")
 
@@ -434,7 +571,9 @@ def main():
                        help='Path to dataset CSV')
     args = parser.parse_args()
 
-    verdict, results = run_augmentation_experiment(args.config, args.dataset)
+    # Fix unpacking: function returns (run_dir, verdict, results_json)
+    run_dir, verdict, results = run_augmentation_experiment(args.config, args.dataset)
+    print(f"Run dir: {run_dir} Verdict: {verdict}")
     return verdict
 
 

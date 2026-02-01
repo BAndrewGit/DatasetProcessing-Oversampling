@@ -1,0 +1,20 @@
+experiment:
+  name: "domain_transfer_test"
+  seed: 42
+  output_dir: "runs"
+
+data:
+  adv_dataset_path: "data/processed/1_encoded.csv"
+  gmsc_dataset_path: "data/gmsc/GiveMeSomeCredit-training.csv"
+
+cross_validation:
+  enabled: true
+  n_splits: 2
+  n_repeats: 1
+  shuffle: true
+
+domain_alignment:
+  enabled: false
+
+model:
+  type: "small_mlp"

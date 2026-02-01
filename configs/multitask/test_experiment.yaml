@@ -1,0 +1,25 @@
+experiment:
+  name: "multitask_test"
+  seed: 42
+  output_dir: "runs"
+
+data:
+  dataset_path: "data/processed/1_encoded.csv"
+  target_type: "multitask"
+  # Expected keys used by multitask runner
+
+preprocessing:
+  ignored_columns:
+    - "Behavior_Risk_Level"
+
+cross_validation:
+  enabled: true
+  n_splits: 2
+  n_repeats: 1
+  shuffle: true
+
+model:
+  trunk_hidden: 16
+  heads:
+    risk: {type: "ridge"}
+    savings: {type: "logistic_regression"}

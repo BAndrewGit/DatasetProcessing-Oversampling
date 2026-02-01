@@ -1,0 +1,38 @@
+experiment:
+  name: "latent_sampling_test"
+  seed: 42
+  output_dir: "runs"
+
+data:
+  dataset_path: "data/processed/1_encoded.csv"
+  target_column: "Risk_Score"
+
+cross_validation:
+  enabled: true
+  n_splits: 2
+  n_repeats: 1
+  shuffle: true
+
+pca:
+  ks: [10, 8, 5]
+  whiten_options: [false, true]
+
+clustering:
+  ks: [2,3,4]
+
+sampling:
+  synth_counts: [10,50,100]
+  global_cap: 0.3
+  per_cluster_cap: 0.2
+
+model:
+  hidden_size: 32
+  max_epochs: 5
+  early_stopping: true
+  batch_size: 32
+
+quality_gates:
+  discriminator_auc_threshold: 0.75
+  memorization_knn_k: 3
+  utility_drop_threshold: -0.02
+  stability_variance_increase: 0.2

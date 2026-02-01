@@ -1,0 +1,14 @@
+target: Risk_Score
+task: regression          # or classification
+n_splits: 5
+seed: 42
+pca_candidates: [30,25,20,15,10,8,5,3]
+k_candidates: [2,3,4,5]
+min_cluster_frac: 0.05
+per_cluster_cap_frac: 0.2
+global_cap_frac: 0.3
+sampling_method: gaussian
+memorization_min_threshold: 1e-6
+onehot_groups: null
+forbidden_column: Behavior_Risk_Level
+

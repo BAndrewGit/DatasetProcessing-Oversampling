@@ -237,3 +237,19 @@ def scale_numeric_columns(df, columns, scaler_path=None, fit=True):
         if not scaler_path:
             raise ValueError("scaler_path required when fit=False")
         return apply_existing_scaler(df, columns, scaler_path)
+
+
+# Backwards-compatible wrapper expected by old augmentation scripts
+def calculate_risk_score(df, method='advanced', **kwargs):
+    """
+    Wrapper to produce (df_with_risk, metadata) to be compatible with older scripts.
+    method: 'advanced' (default) or 'clusters'
+    Returns: (df, info_dict)
+    """
+    if method == 'clusters':
+        df_out = calculate_risk_clusters(df, **{k: v for k, v in kwargs.items() if k in ['cluster_range']})
+        return df_out, {'method': 'clusters'}
+    else:
+        df_out = calculate_risk_advanced(df, **{k: v for k, v in kwargs.items() if k in ['gmm_clusters', 'confidence_threshold', 'iterations']})
+        return df_out, {'method': 'advanced'}
+

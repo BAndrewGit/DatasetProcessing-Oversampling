@@ -208,19 +208,26 @@ The project is organized into logical subfolders for easy navigation:
 ```
 Procesare Dataset/
 ├── runners/                    # Experiment execution scripts
+│   ├── run_pipeline.py         # Full pipeline runner (recommended)
 │   ├── run_baseline.py         # Baseline experiments (no augmentation)
+│   ├── run_latent_sampling_experiment.py  # Latent space oversampling
 │   ├── run_multitask_experiment.py    # Multi-task learning
 │   ├── run_domain_transfer_experiment.py  # Domain transfer (ADV+GMSC)
 │   ├── run_analysis.py         # Interpretability and paper artifacts
-│   └── augmentation_experiment.py  # Synthetic data experiments
+│   └── augmentation_experiment.py  # [DEPRECATED] Old jitter/SMOTE experiments
 │
 ├── experiments/                # Core ML modules
 │   ├── config_schema.py        # Configuration validation
 │   ├── cv.py                   # Cross-validation
 │   ├── data.py                 # Data loading/preprocessing
 │   ├── models.py               # Model builders
+│   ├── latent_space.py         # PCA selection for latent space
+│   ├── latent_sampling.py      # Cluster-conditioned synthetic sampling
+│   ├── latent_experiment.py    # Full latent oversampling experiment
+│   ├── clustering_latent.py    # KMeans clustering in latent space
 │   ├── multitask.py            # Multi-task architecture
-│   └── domain_transfer.py      # Domain transfer architecture
+│   ├── domain_transfer.py      # Domain transfer architecture
+│   └── save_model.py           # Model saving utilities
 │
 ├── analysis/                   # Interpretability and analysis
 │   ├── interpretability.py     # Feature importance, SHAP
@@ -233,9 +240,9 @@ Procesare Dataset/
 │   ├── baseline/               # Baseline experiment configs
 │   │   ├── regression.yaml
 │   │   └── classification.yaml
-│   ├── augmentation/           # Augmentation experiment configs
+│   ├── latent_sampling/        # Latent space oversampling configs
 │   │   ├── experiment.yaml
-│   │   └── smote.yaml
+│   │   └── test_experiment.yaml
 │   ├── multitask/              # Multi-task configs
 │   │   └── experiment.yaml
 │   └── transfer/               # Domain transfer configs
@@ -243,8 +250,8 @@ Procesare Dataset/
 │
 ├── DataAugmentation/           # Synthetic data generation
 │   ├── quality_gates.py        # Mandatory quality checks
-│   ├── smote_tomek.py          # SMOTE-Tomek
-│   └── cluster_enrichment.py   # Cluster-aware enrichment
+│   ├── cluster_enrichment.py   # Cluster-aware enrichment
+│   └── smote_tomek.py          # [DEPRECATED] SMOTE-Tomek
 │
 ├── FirstProcessing/            # Data preprocessing pipeline
 │   ├── main.py                 # Main preprocessing runner
@@ -311,13 +318,29 @@ python FirstProcessing/main.py
 
 Each experiment creates a folder in `runs/` containing:
 
-| File                  | Description                               |
-|-----------------------|-------------------------------------------|
-| `config.yaml`         | Exact configuration used                  |
-| `metrics.json`        | CV metrics (mean, std, fold-level values) |
-| `model.joblib`        | Final trained model                       |
-| `data_profile.json`   | Dataset hash, size, features              |
-| `cv_distribution.png` | CV score distributions                    |
+| File                      | Description                                    |
+|---------------------------|------------------------------------------------|
+| `config.yaml`             | Exact configuration used                       |
+| `metrics.json`            | CV metrics (mean, std, fold-level values)      |
+| `model.joblib`            | Final trained model (sklearn-compatible)       |
+| `scaler.joblib`           | Fitted StandardScaler                          |
+| `data_profile.json`       | Dataset hash, size, features, augmentation stats |
+| `model_metadata.json`     | Model artifacts metadata                       |
+| `cv_distribution.png`     | CV score distributions                         |
+
+### Additional files for latent oversampling runs:
+
+| File                        | Description                                   |
+|-----------------------------|-----------------------------------------------|
+| `oversampled_dataset.csv`   | Full dataset with `is_synthetic` column       |
+| `augmented_data.csv`        | Clean augmented dataset (ready to use)        |
+| `pca.joblib`                | Fitted PCA model                              |
+| `kmeans.joblib`             | Fitted KMeans clusterer                       |
+| `pca_selection.json`        | PCA K selection details and EVR               |
+| `cluster_report.json`       | Clustering results (silhouette, DBI, sizes)   |
+| `synthetic_audit.json`      | Quality gate results                          |
+| `latent_cluster_scatter.png`| 2D cluster visualization                      |
+| `pca_evr.png`               | Explained variance ratio plot                 |
 
 ---
 
@@ -333,6 +356,26 @@ pip install pytest pytest-cov
 
 ## Usage
 
+### Quick Start: Full Pipeline (Recommended)
+
+The easiest way to run all experiments is using the unified pipeline runner:
+
+```bash
+# Run full pipeline in test mode (fast, for development)
+python runners/run_pipeline.py --test-mode --data data/processed/1_encoded.csv
+
+# Run full pipeline in production mode
+python runners/run_pipeline.py --data data/processed/1_encoded.csv
+```
+
+The pipeline automatically runs:
+1. **Baseline experiments** (regression + classification)
+2. **Latent Space Oversampling** (PCA + clustering synthetic generation)
+3. **Multi-task ablation** (shared trunk experiment)
+4. **Domain transfer** (ADV + GMSC)
+5. **Comprehensive analysis**
+6. **Test suite**
+
 ### 1. Baseline experiments (single-task)
 
 ```bash
@@ -343,7 +386,26 @@ python runners/run_baseline.py --config configs/baseline/regression.yaml
 python runners/run_baseline.py --config configs/baseline/classification.yaml
 ```
 
-### 2. Multi-task ablation experiment
+### 2. Latent Space Oversampling (NEW - Replaces old SMOTE/jitter)
+
+The primary method for synthetic data generation now uses **PCA latent space + clustering**:
+
+```bash
+python runners/run_latent_sampling_experiment.py \
+  --config configs/latent_sampling/experiment.yaml \
+  --dataset data/processed/1_encoded.csv \
+  --output runs/latent_experiment
+```
+
+**Output files:**
+- `oversampled_dataset.csv` - Full dataset with `is_synthetic` column (0=real, 1=synthetic)
+- `augmented_data.csv` - Clean dataset ready for use (no `is_synthetic` column)
+- `data_profile.json` - Statistics: `n_synthetic`, `n_total`, `augmentation_ratio`
+- `model.joblib` - Trained MLP model
+- `scaler.joblib` - Fitted StandardScaler
+- Per-fold artifacts: `pca.joblib`, `kmeans.joblib`, cluster plots, etc.
+
+### 3. Multi-task ablation experiment
 
 ```bash
 # Run all three experiments (risk-only, savings-only, multi-task)
@@ -355,18 +417,13 @@ python runners/run_multitask_experiment.py --config configs/multitask/experiment
 # - Multi-task model (shared trunk)
 ```
 
-### 3. Domain transfer experiment
+### 4. Domain transfer experiment
 
 ```bash
 # Run ADV-only vs ADV+GMSC transfer comparison
 python runners/run_domain_transfer_experiment.py --config configs/transfer/domain_transfer.yaml
 ```
 
-### 4. Synthetic data experiments
-
-```bash
-python runners/augmentation_experiment.py --config configs/augmentation/experiment.yaml
-```
 
 ### 5. Analysis and interpretability
 
@@ -407,11 +464,90 @@ Baseline runs **never** allow synthetic augmentation.
 
 ---
 
-## Running augmentation experiments (optional)
+## Running augmentation experiments (Latent Space Oversampling)
 
-This mode tests whether synthetic data improves **real-only performance**. If any quality gate fails, the pipeline automatically falls back to real-only data.
+This mode generates synthetic data using **PCA latent space + clustering** and tests whether it improves **real-only performance**. If any quality gate fails, the pipeline automatically falls back to real-only data.
+
+### How it works
+
+1. **PCA dimensionality reduction** - Fit PCA on training data to create latent space
+2. **K selection** - Automatically choose optimal K using EVR threshold (≥85%) or knee detection
+3. **Clustering** - KMeans clustering in latent space (k=2..5, chosen by silhouette score)
+4. **Synthetic sampling** - Generate samples within each cluster using Gaussian or kNN jitter
+5. **Quality gates** - Validate synthetic data (memorization, two-sample, utility, stability)
+6. **Label assignment** - Copy labels from nearest real neighbors
+
+### Running the experiment
 
 ```bash
+python runners/run_latent_sampling_experiment.py \
+  --config configs/latent_sampling/experiment.yaml \
+  --dataset data/processed/1_encoded.csv \
+  --output runs/latent_oversampling
+```
+
+### Configuration options
+
+```yaml
+# configs/latent_sampling/experiment.yaml
+pca:
+  ks: [30, 25, 20, 15, 10, 8, 5]  # K candidates to evaluate
+  whiten_options: [false, true]   # Test with/without whitening
+
+clustering:
+  ks: [2, 3, 4, 5]                # Number of clusters to test
+
+sampling:
+  synth_counts: [0, 10, 50, 100, 500]  # Synthetic samples to generate
+  global_cap: 0.3                 # Max 30% synthetic ratio
+  per_cluster_cap: 0.2            # Max 20% per cluster
+```
+
+### Output structure
+
+```
+runs/latent_oversampling/
+├── fold_1/
+│   ├── pca_selection.json        # PCA K selection details
+│   ├── cluster_report.json       # Clustering results
+│   ├── synthetic_audit.json      # Quality gate results
+│   ├── metrics.json              # Fold-level metrics
+│   ├── model.joblib              # Trained MLP
+│   ├── scaler.joblib             # StandardScaler
+│   ├── pca.joblib                # Fitted PCA
+│   ├── kmeans.joblib             # Fitted KMeans
+│   ├── pca_evr.png               # EVR plot
+│   ├── latent_cluster_scatter.png # Cluster visualization
+│   └── anchor_predictions_vs_synth_count.png
+├── ...
+├── oversampled_dataset.csv       # Full augmented dataset (with is_synthetic flag)
+├── augmented_data.csv            # Clean augmented dataset (ready to use)
+├── data_profile.json             # Augmentation statistics
+├── metrics.json                  # Aggregated metrics
+└── model.joblib                  # Representative model
+```
+
+### Synthetic data statistics
+
+The `data_profile.json` contains augmentation statistics:
+
+```json
+{
+  "n_samples": 189,
+  "n_synthetic": 37,
+  "n_total": 226,
+  "augmentation_ratio": 0.196,
+  "oversampled_dataset": "runs/.../oversampled_dataset.csv",
+  "augmented_data": "runs/.../augmented_data.csv"
+}
+```
+
+### Legacy method (DEPRECATED)
+
+The old jitter/SMOTE augmentation is still available but deprecated:
+
+```bash
+# DEPRECATED - use latent_sampling instead
 python runners/augmentation_experiment.py \
   --config configs/augmentation/experiment.yaml \
   --dataset path/to/data.csv
@@ -493,6 +629,86 @@ domain_alignment:
 model:
   gmsc_risk_weight: 0.5 # Auxiliary supervision weight
 ```
+
+---
+
+## Latent Space Oversampling (Primary Augmentation Method)
+
+This is the **primary method for synthetic data generation**, replacing the old jitter/SMOTE approaches. It generates synthetic samples in a PCA-reduced latent space using cluster-conditioned sampling.
+
+### Why Latent Space?
+
+1. **Dimensionality reduction** - PCA removes noise and captures essential variance
+2. **Cluster structure** - Synthetic samples respect natural data clusters
+3. **Quality control** - Easier to validate in lower-dimensional space
+4. **Interpretability** - Clear visualization of synthetic vs real samples
+
+### Algorithm Overview
+
+```
+1. Fit PCA on X_train → Z_train (latent space)
+2. Select optimal K using EVR threshold (≥85%) or knee detection
+3. Fit KMeans in Z_train → cluster labels
+4. For each cluster c:
+   a. Select base sample z_i from cluster c
+   b. Select neighbor z_j from same cluster (kNN)
+   c. Generate: z_synth = z_i + α*(z_j - z_i) + ε
+   d. Where α ~ Uniform(0,1), ε ~ Normal(0, σ_c * noise_scale)
+5. Decode: x_synth = PCA.inverse_transform(z_synth)
+6. Post-process: clip values, enforce one-hot constraints
+7. Assign labels from nearest real neighbor
+8. Run quality gates → accept or reject
+```
+
+### PCA K Selection Strategy
+
+The algorithm automatically selects the optimal number of PCA components:
+
+1. **Target EVR method** - Find smallest K with EVR ≥ 85%
+2. **Knee detection** - If no K achieves target, find where marginal gain drops
+3. **Fallback** - Use max EVR candidate if nothing else works
+
+**Note:** The full dimension (K = n_features) is NOT automatically added to candidates when explicit K values are provided.
+
+### Clustering in Latent Space
+
+- **Algorithm**: KMeans (standard, or optionally Wasserstein K-Means)
+- **K candidates**: 2, 3, 4, 5 (configurable)
+- **Selection criteria**: Maximum silhouette score, tie-break by Davies-Bouldin index
+- **Constraint**: Minimum cluster size ≥ max(10, 5% of n_train)
+
+### Quality Gates
+
+All synthetic data must pass these gates per fold:
+
+| Gate         | Requirement                        | Threshold        |
+|--------------|------------------------------------|------------------|
+| Memorization | Near-duplicate rate                | < 5%             |
+| Two-sample   | Discriminator AUC (real vs synth)  | < 0.75           |
+| Utility      | Performance degradation            | < 2%             |
+| Stability    | Variance increase                  | < 20%            |
+| Anchor       | Prediction drift on held-out       | < 25% of std(y)  |
+
+### Synthetic Ratio Limits
+
+- **Per-cluster cap**: Max 20% of cluster size
+- **Global cap**: Max 30% of total training data
+- **Hard safety cap**: Never exceed 50%
+
+### Files Generated
+
+Per-fold outputs in `runs/<run_id>/fold_N/`:
+- `pca_selection.json` - K candidates, EVR, reconstruction error
+- `cluster_report.json` - Silhouette, DBI, cluster sizes
+- `synthetic_audit.json` - Quality gate results
+- `model.joblib`, `scaler.joblib`, `pca.joblib`, `kmeans.joblib`
+- Various diagnostic plots
+
+Run-level outputs in `runs/<run_id>/`:
+- **`oversampled_dataset.csv`** - Combined real + synthetic with `is_synthetic` flag
+- **`augmented_data.csv`** - Clean version ready for downstream use
+- `data_profile.json` - Augmentation statistics
+- `metrics.json` - Aggregated CV metrics
 
 ---
 

@@ -266,7 +266,7 @@ def train_single_task_risk(X_train, y_train, X_val, y_val, config, seed):
 
     # Extract only risk metrics
     risk_metrics = {k: v for k, v in metrics.items() if k.startswith('risk_')}
-    return risk_metrics
+    return risk_metrics, trainer.model
 
 
 def train_single_task_savings(X_train, y_train, X_val, y_val, config, seed):
@@ -310,7 +310,7 @@ def train_single_task_savings(X_train, y_train, X_val, y_val, config, seed):
 
     # Extract only savings metrics
     savings_metrics = {k: v for k, v in metrics.items() if k.startswith('savings_')}
-    return savings_metrics
+    return savings_metrics, trainer.model
 
 
 def train_multitask(X_train, y_risk_train, y_savings_train,
@@ -354,5 +354,4 @@ def train_multitask(X_train, y_risk_train, y_savings_train,
 
     metrics = trainer.fit(train_loader, val_loader, max_epochs=config.get('max_epochs', 100))
 
-    return metrics
-
+    return metrics, trainer.model

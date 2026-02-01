@@ -1,0 +1,26 @@
+# Compact regression test config for quick smoke runs
+seed: 42
+data:
+  dataset_path: data/processed/1_encoded.csv
+  target_column: Risk_Score
+  target_type: regression
+model:
+  type: RandomForest
+  params:
+    n_estimators: 50
+    max_depth: 5
+cv:
+  folds: 5
+  repeats: 2
+output:
+  save_models: true
+  out_dir: runs/model_comparison_test
+augmentation:
+  enabled: false
+multitask:
+  enabled: false
+domain_transfer:
+  enabled: false
+analysis:
+  enabled: false
+

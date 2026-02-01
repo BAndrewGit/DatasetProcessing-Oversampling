@@ -119,6 +119,8 @@ def run_multitask_cv(X, y_risk, y_savings, config):
     risk_only_metrics = []
     savings_only_metrics = []
     multitask_metrics = []
+    # Keep last model for each ablation to save
+    saved_models = {'risk_only': None, 'savings_only': None, 'multitask': None}
 
     for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X)):
         if (fold_idx + 1) % 5 == 0 or fold_idx == 0:
@@ -129,26 +131,29 @@ def run_multitask_cv(X, y_risk, y_savings, config):
         y_savings_train, y_savings_val = y_savings.iloc[train_idx].values, y_savings.iloc[val_idx].values
 
         # Risk-only
-        risk_metrics = train_single_task_risk(
+        risk_metrics, risk_model = train_single_task_risk(
             X_train, y_risk_train, X_val, y_risk_val,
             config['model'], seed + fold_idx
         )
         risk_only_metrics.append(risk_metrics)
+        saved_models['risk_only'] = risk_model
 
         # Savings-only
-        savings_metrics = train_single_task_savings(
+        savings_metrics, savings_model = train_single_task_savings(
             X_train, y_savings_train, X_val, y_savings_val,
             config['model'], seed + fold_idx
         )
         savings_only_metrics.append(savings_metrics)
+        saved_models['savings_only'] = savings_model
 
         # Multi-task
-        mt_metrics = train_multitask(
+        mt_metrics, mt_model = train_multitask(
             X_train, y_risk_train, y_savings_train,
             X_val, y_risk_val, y_savings_val,
             config['model'], seed + fold_idx
         )
         multitask_metrics.append(mt_metrics)
+        saved_models['multitask'] = mt_model
 
     # Aggregate results
     results = {
@@ -157,7 +162,7 @@ def run_multitask_cv(X, y_risk, y_savings, config):
         'multitask': _aggregate_metrics(multitask_metrics)
     }
 
-    return results
+    return results, saved_models
 
 
 def _aggregate_metrics(metrics_list):
@@ -238,20 +243,16 @@ def print_results(results):
     print("=" * 80)
 
 
-def run_multitask_experiment(config_path, dataset_path=None):
+def run_multitask_experiment(config_path, dataset_path=None, output_dir=None):
     """
     Run multi-task learning ablation experiment.
-
-    Compares:
-    1. Risk-only model
-    2. Savings-only model
-    3. Multi-task model
-
-    Returns:
-        run_dir: Path to experiment output directory
     """
     # Load and validate config
     config = load_config(config_path)
+
+    # Override output_dir if provided
+    if output_dir:
+        config['experiment']['output_dir'] = output_dir
 
     try:
         validate_config(config, mode='multitask')
@@ -284,7 +285,7 @@ def run_multitask_experiment(config_path, dataset_path=None):
     X, y_risk, y_savings = preprocess_multitask_data(df, config)
 
     # Run CV ablation
-    results = run_multitask_cv(X, y_risk, y_savings, config)
+    results, saved_models = run_multitask_cv(X, y_risk, y_savings, config)
 
     # Print results
     print_results(results)
@@ -311,6 +312,49 @@ def run_multitask_experiment(config_path, dataset_path=None):
     with open(os.path.join(run_dir, 'ablation_results.json'), 'w') as f:
         json.dump(serialize_value(results), f, indent=2)
 
+    # Save trained models if returned
+    try:
+        import torch as _torch
+        if 'risk_only' in saved_models and saved_models['risk_only'] is not None:
+            _torch.save(saved_models['risk_only'].state_dict(), os.path.join(run_dir, 'risk_only_model.pth'))
+        if 'savings_only' in saved_models and saved_models['savings_only'] is not None:
+            _torch.save(saved_models['savings_only'].state_dict(), os.path.join(run_dir, 'savings_only_model.pth'))
+        if 'multitask' in saved_models and saved_models['multitask'] is not None:
+            _torch.save(saved_models['multitask'].state_dict(), os.path.join(run_dir, 'multitask_model.pth'))
+    except Exception as e:
+        print(f"Warning: failed to save multitask models: {e}")
+
+    # Also save a fitted StandardScaler for analysis tooling (joblib) and a small metadata file
+    try:
+        from sklearn.preprocessing import StandardScaler
+        from experiments.save_model import save_sklearn_model, write_model_metadata
+        import joblib as _joblib
+
+        scaler = StandardScaler()
+        # X may be a DataFrame from preprocess; fit on full features
+        try:
+            _X_for_scaler = X.values if hasattr(X, 'values') else X
+        except Exception:
+            _X_for_scaler = X
+        scaler.fit(_X_for_scaler)
+        scaler_path = os.path.join(run_dir, 'scaler.joblib')
+        save_sklearn_model(scaler, scaler_path)
+
+        # Write metadata pointing to saved model files
+        metadata = {
+            'pytorch_state_dicts': {
+                'risk_only': 'risk_only_model.pth' if 'risk_only' in saved_models and saved_models['risk_only'] is not None else None,
+                'savings_only': 'savings_only_model.pth' if 'savings_only' in saved_models and saved_models['savings_only'] is not None else None,
+                'multitask': 'multitask_model.pth' if 'multitask' in saved_models and saved_models['multitask'] is not None else None
+            },
+            'sklearn_objects': {
+                'scaler': 'scaler.joblib'
+            }
+        }
+        write_model_metadata(run_dir, metadata)
+    except Exception as e:
+        print(f"Warning: failed to save scaler or metadata for multitask run: {e}")
+
     print(f"\nResults saved to: {run_dir}")
 
     return run_dir
@@ -324,4 +368,3 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     run_multitask_experiment(args.config, args.dataset)
-

@@ -1,0 +1,39 @@
+experiment:
+  name: "augmentation_experiment_test"
+  seed: 42
+  output_dir: "runs"
+
+data:
+  dataset_path: null
+  target_column: "Risk_Score"
+  target_type: "regression"
+
+preprocessing:
+  ignored_columns:
+    - "Behavior_Risk_Level"
+  columns_to_drop:
+    - "Confidence"
+    - "Outlier"
+    - "Cluster"
+    - "Auto_Label"
+
+augmentation:
+  enabled: true
+  synthetic_ratio: 0.15
+  max_ratio: 0.30
+  method: "jitter"
+
+cross_validation:
+  enabled: true
+  n_splits: 2
+  n_repeats: 1
+  shuffle: true
+
+model:
+  type: "ridge"
+
+quality_gates:
+  memorization_threshold: 0.05
+  max_discriminator_auc: 0.75
+  min_utility_improvement: -0.02
+  max_variance_increase: 0.20

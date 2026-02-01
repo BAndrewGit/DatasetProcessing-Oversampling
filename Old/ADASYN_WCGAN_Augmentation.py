@@ -14,6 +14,8 @@ from sklearn.impute import SimpleImputer
 from sdv.single_table import CTGANSynthesizer
 from sdv.metadata import SingleTableMetadata
 
+from FirstProcessing.risk_calculation import calculate_risk_score
+
 # Importăm funcțiile comune din scriptul WCGAN_Augmentation
 from WCGAN_Augmentation import preprocess_data, safe_int, apply_constraints
 

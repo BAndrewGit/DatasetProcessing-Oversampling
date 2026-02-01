@@ -1,0 +1,36 @@
+# Test config for fast classification baseline (do not use for final results)
+experiment:
+  name: "test_baseline_classification"
+  seed: 42
+  output_dir: "runs"
+data:
+  dataset_path: "data/processed/encoded_dataset.csv"
+  test_size: 0.2
+  target_column: "Save_Money_Yes"
+  target_type: "classification"
+preprocessing:
+  ignored_columns:
+    - "Behavior_Risk_Level"
+    - "Risk_Score"
+    - "Save_Money_No"
+  columns_to_drop:
+    - "Confidence"
+    - "Outlier"
+    - "Cluster"
+    - "Auto_Label"
+augmentation:
+  enabled: false
+model:
+  type: "logistic_regression"
+  params:
+    logistic_regression:
+      C: 1.0
+      class_weight: "balanced"
+      solver: "lbfgs"
+      max_iter: 100
+cross_validation:
+  enabled: true
+  n_splits: 2
+  n_repeats: 1
+  shuffle: true
+

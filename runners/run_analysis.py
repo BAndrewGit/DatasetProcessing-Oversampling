@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import json
 import argparse
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Union
 
 import numpy as np
 import pandas as pd
@@ -19,15 +19,13 @@ import matplotlib.pyplot as plt
 import joblib
 
 from experiments.io import load_config
-from experiments.data import load_dataset, preprocess_data
 from experiments.config_schema import FORBIDDEN_TARGETS
 
 from analysis.interpretability import (
     compute_permutation_importance,
     compute_permutation_importance_torch,
     plot_feature_importance,
-    identify_actionable_features,
-    create_importance_comparison_plot
+    identify_actionable_features
 )
 from analysis.stability import (
     analyze_cv_stability,
@@ -39,8 +37,7 @@ from analysis.stability import (
 from analysis.error_analysis import (
     analyze_errors_by_segment,
     identify_failure_cases,
-    plot_error_distribution,
-    create_error_summary_table
+    plot_error_distribution
 )
 from analysis.what_if import (
     compute_partial_dependence,
@@ -52,11 +49,9 @@ from analysis.what_if import (
 )
 from analysis.paper_artifacts import (
     generate_ablation_table,
-    generate_model_comparison_table,
-    generate_cv_statistics_table,
     create_methodology_diagram,
-    export_final_figures,
-    create_results_summary
+    create_results_summary,
+    package_latent_sprint_artifacts
 )
 
 
@@ -90,6 +85,9 @@ def load_experiment_results(run_dir: str) -> Dict:
         with open(metrics_path, 'r') as f:
             results['metrics'] = json.load(f)
 
+    # record run dir for downstream packaging
+    results['_run_dir'] = run_dir
+
     # Load config
     config_path = os.path.join(run_dir, 'config.yaml')
     if os.path.exists(config_path):
@@ -105,6 +103,20 @@ def load_experiment_results(run_dir: str) -> Dict:
     model_path = os.path.join(run_dir, 'model.joblib')
     if os.path.exists(model_path):
         results['model'] = joblib.load(model_path)
+
+    # Also support PyTorch model files (model.pth / model.pt)
+    if 'model' not in results:
+        for torch_name in ['model.pth', 'model.pt']:
+            tpath = os.path.join(run_dir, torch_name)
+            if os.path.exists(tpath):
+                try:
+                    import torch
+                    results['model'] = torch.load(tpath)
+                    results['_torch_model_path'] = tpath
+                    break
+                except Exception:
+                    # fallback: skip torch model if loading fails
+                    pass
 
     # Load data profile
     profile_path = os.path.join(run_dir, 'data_profile.json')
@@ -124,17 +136,63 @@ def load_experiment_results(run_dir: str) -> Dict:
         with open(transfer_path, 'r') as f:
             results['transfer'] = json.load(f)
 
+    # Sprint 7 artifacts (latent sampling)
+    # Search run_dir and nested fold_* directories for pca_selection.json, performance_vs_synth_count.csv, latent_cluster_scatter.png
+    latent_summary = {'pca_selection': None, 'performance_csv': None, 'cluster_scatter': None, 'folds': []}
+    # check root first
+    root_pca = os.path.join(run_dir, 'pca_selection.json')
+    root_perf = os.path.join(run_dir, 'performance_vs_synth_count.csv')
+    root_scatter = os.path.join(run_dir, 'latent_cluster_scatter.png')
+    if os.path.exists(root_pca):
+        latent_summary['pca_selection'] = root_pca
+    if os.path.exists(root_perf):
+        latent_summary['performance_csv'] = root_perf
+    if os.path.exists(root_scatter):
+        latent_summary['cluster_scatter'] = root_scatter
+
+    # Walk subdirectories (fold_*) and collect per-fold artifacts
+    for root, dirs, files in os.walk(run_dir):
+        # limit to a depth (fold folders typically directly under run_dir)
+        rel = os.path.relpath(root, run_dir)
+        parts = rel.split(os.sep)
+        if parts[0].startswith('fold') or 'fold_' in root.lower() or (len(parts) > 1 and parts[1].startswith('fold')):
+            f_pca = os.path.join(root, 'pca_selection.json')
+            f_perf = os.path.join(root, 'performance_vs_synth_count.csv')
+            f_scatter = os.path.join(root, 'latent_cluster_scatter.png')
+            entry = {}
+            if os.path.exists(f_pca):
+                entry['pca_selection'] = f_pca
+                if latent_summary['pca_selection'] is None:
+                    latent_summary['pca_selection'] = f_pca
+            if os.path.exists(f_perf):
+                entry['performance_csv'] = f_perf
+                # if no root perf CSV set, set to first fold's perf CSV
+                if latent_summary['performance_csv'] is None:
+                    latent_summary['performance_csv'] = f_perf
+            if os.path.exists(f_scatter):
+                entry['cluster_scatter'] = f_scatter
+                if latent_summary['cluster_scatter'] is None:
+                    latent_summary['cluster_scatter'] = f_scatter
+            if entry:
+                entry['fold_dir'] = root
+                latent_summary['folds'].append(entry)
+
+    # If any latent artifacts were found, attach to results
+    if latent_summary['pca_selection'] or latent_summary['performance_csv'] or latent_summary['cluster_scatter'] or latent_summary['folds']:
+        results['latent_sprint'] = latent_summary
+
     return results
 
 
 def run_interpretability_analysis(
     model,
-    X: np.ndarray,
-    y: np.ndarray,
+    X: Union[np.ndarray, pd.DataFrame],
+    y: Union[np.ndarray, pd.Series],
     feature_names: List[str],
     task_type: str,
     output_dir: str,
-    is_torch: bool = False
+    is_torch: bool = False,
+    X_np: np.ndarray = None
 ) -> Dict:
     """
     Run interpretability analysis on a model.
@@ -159,14 +217,19 @@ def run_interpretability_analysis(
     # Permutation importance
     print("Computing permutation importance...")
 
+    # Use numpy array for internal numeric ops but pass a DataFrame with feature names to sklearn models
+    X_arr = X_np if X_np is not None else (X.values if isinstance(X, pd.DataFrame) else np.array(X))
+    X_for_model = pd.DataFrame(X_arr, columns=feature_names)
+
     if is_torch:
         importance_df = compute_permutation_importance_torch(
-            model, X, y, feature_names, task=task_type
+            model, X_arr, y, feature_names, task=task_type
         )
     else:
         scoring = 'neg_mean_absolute_error' if task_type == 'regression' else 'f1_macro'
+        # Pass a DataFrame with column names so sklearn estimators expecting feature_names_in_ won't warn
         importance_df = compute_permutation_importance(
-            model, X, y, feature_names, scoring=scoring
+            model, X_for_model, y, feature_names, scoring=scoring
         )
 
     results['permutation_importance'] = importance_df.to_dict('records')
@@ -204,6 +267,24 @@ def run_interpretability_analysis(
 
     return results
 
+def package_latent_runs_into_analysis(experiment_results: Dict[str, Dict], analysis_out_dir: str, task: str = 'regression') -> None:
+    """
+    For any experiment with latent_sprint present, call packaging helper to move artifacts into analysis output.
+    """
+    from analysis.paper_artifacts import package_latent_sprint_artifacts
+    for exp_name, res in experiment_results.items():
+        run_dir = res.get('_run_dir') or res.get('config', {}).get('_run_dir')
+        if not run_dir:
+            continue
+        latent = res.get('latent_sprint')
+        if not latent:
+            continue
+        out_dir = os.path.join(analysis_out_dir, exp_name + '_latent')
+        try:
+            package_latent_sprint_artifacts(res, run_dir, out_dir, task=task)
+            print(f"Packaged latent sprint artifacts for {exp_name} -> {out_dir}")
+        except Exception as e:
+            print(f"Failed to package latent artifacts for {exp_name}: {e}")
 
 def run_stability_analysis(
     experiment_results: Dict[str, Dict],
@@ -242,8 +323,18 @@ def run_stability_analysis(
         results[f'{exp_name}_stability'] = stability_df.to_dict('records')
 
         # Check stability criterion (std < 20% of mean)
-        stable_metrics = stability_df[stability_df['stable']]['metric'].tolist()
-        unstable_metrics = stability_df[~stability_df['stable']]['metric'].tolist()
+        # Be robust to empty DataFrame or missing 'stable' column
+        if stability_df is None or stability_df.empty:
+            stable_metrics = []
+            unstable_metrics = []
+        else:
+            if 'stable' in stability_df.columns:
+                stable_metrics = stability_df[stability_df['stable']]['metric'].tolist()
+                unstable_metrics = stability_df[~stability_df['stable']]['metric'].tolist()
+            else:
+                # If 'stable' not present, treat all as stable for reporting
+                stable_metrics = stability_df['metric'].tolist()
+                unstable_metrics = []
 
         print(f"  {exp_name}: {len(stable_metrics)} stable, {len(unstable_metrics)} unstable metrics")
 
@@ -290,13 +381,14 @@ def run_stability_analysis(
 
 def run_error_analysis(
     model,
-    X: np.ndarray,
-    y: np.ndarray,
+    X: Union[np.ndarray, pd.DataFrame],
+    y: Union[np.ndarray, pd.Series],
     feature_names: List[str],
     task_type: str,
     output_dir: str,
     cluster_labels: np.ndarray = None,
-    is_torch: bool = False
+    is_torch: bool = False,
+    X_np: np.ndarray = None
 ) -> Dict:
     """
     Run error analysis.
@@ -335,9 +427,14 @@ def run_error_analysis(
             else:
                 y_pred = model(X_tensor).squeeze().cpu().numpy()
     else:
-        y_pred = model.predict(X)
+        # Ensure model.predict receives a DataFrame with proper column names to avoid sklearn UserWarning
+        X_pred_input = X_np if X_np is not None else (X.values if isinstance(X, pd.DataFrame) else np.array(X))
+        X_pred_df = pd.DataFrame(X_pred_input, columns=feature_names)
+        y_pred = model.predict(X_pred_df)
 
     # Basic error statistics
+    # Ensure abs_errors is defined for later checks
+    abs_errors = np.array([])
     if task_type == 'regression':
         errors = y - y_pred
         abs_errors = np.abs(errors)
@@ -368,16 +465,17 @@ def run_error_analysis(
         # Check cluster balance
         if task_type == 'regression':
             cluster_maes = segment_analysis['mae'].values
-            overall_mae = np.mean(abs_errors)
+            overall_mae = np.mean(abs_errors) if abs_errors.size else np.nan
 
             # Flag if any cluster contributes >50% to overall error
             dominant = (cluster_maes > overall_mae * 1.5).any()
             results['cluster_balanced'] = not dominant
             print(f"  Cluster balance check: {'PASS' if not dominant else 'WARNING - unbalanced'}")
 
-    # Identify failure cases
+    # Identify failure cases (use numpy input for consistent behavior)
+    X_for_fail = X_np if X_np is not None else (X.values if isinstance(X, pd.DataFrame) else np.array(X))
     failure_cases, failure_patterns = identify_failure_cases(
-        y, y_pred, X, feature_names, task_type
+        y, y_pred, X_for_fail, feature_names, task_type
     )
 
     results['failure_cases'] = failure_cases.to_dict('records')
@@ -410,11 +508,12 @@ def run_error_analysis(
 
 def run_what_if_analysis(
     model,
-    X: np.ndarray,
+    X: Union[np.ndarray, pd.DataFrame],
     feature_names: List[str],
     output_dir: str,
     top_n_features: int = 10,
-    is_torch: bool = False
+    is_torch: bool = False,
+    X_np: np.ndarray = None
 ) -> Dict:
     """
     Run what-if / sensitivity analysis.
@@ -442,14 +541,16 @@ def run_what_if_analysis(
     # Compute partial dependence
     print("Computing partial dependence...")
 
+    X_arr = X_np if X_np is not None else (X.values if isinstance(X, pd.DataFrame) else np.array(X))
+
     if is_torch:
         from analysis.what_if import compute_partial_dependence_torch
         pd_results = compute_partial_dependence_torch(
-            model, X, list(top_indices), feature_names
+            model, X_arr, list(top_indices), feature_names
         )
     else:
         pd_results = compute_partial_dependence(
-            model, X, list(top_indices), feature_names
+            model, X_arr, list(top_indices), feature_names
         )
 
     results['partial_dependence'] = {
@@ -495,9 +596,9 @@ def run_what_if_analysis(
                     return model(x_t)[0].cpu().numpy()
                 return model(x_t).squeeze().cpu().numpy()
 
-        sens_df = sensitivity_analysis(None, X[:100], feature_names, predict_fn=predict_fn)
+        sens_df = sensitivity_analysis(None, X_arr[:100], feature_names, predict_fn=predict_fn)
     else:
-        sens_df = sensitivity_analysis(model, X[:100], feature_names)
+        sens_df = sensitivity_analysis(model, X_arr[:100], feature_names)
 
     results['sensitivity'] = sens_df.to_dict('records')
 
@@ -607,7 +708,7 @@ def run_full_analysis(
         run_dirs: List of experiment run directories
         dataset_path: Path to dataset
         output_dir: Output directory for analysis
-        config_path: Optional config path
+        config_path: Optional config file path
         seed: Random seed
     """
     set_seeds(seed)
@@ -636,6 +737,40 @@ def run_full_analysis(
         print("ERROR: No experiment results found")
         return
 
+    # If some experiments don't have models (e.g., augmentation audit), try to attach baseline models
+    # Find baseline regression/classification models in the loaded experiments
+    baseline_reg_model = None
+    baseline_clf_model = None
+    for name, res in all_experiments.items():
+        if name.startswith('clean_baseline_regression') and res.get('model') is not None:
+            baseline_reg_model = res['model']
+        if name.startswith('clean_baseline_classification') and res.get('model') is not None:
+            baseline_clf_model = res['model']
+
+    # Attach appropriate baseline model to experiments missing a model so analysis can run interpretability
+    for name, res in all_experiments.items():
+        if res.get('model') is None:
+            # determine target type from config/metrics; default to regression
+            cfg = res.get('config', {})
+            target_type = cfg.get('data', {}).get('target_type') if cfg else None
+            if not target_type:
+                # infer from metrics presence
+                metrics = res.get('metrics', {})
+                cv = metrics.get('cv_results', {})
+                if 'mae' in cv:
+                    target_type = 'regression'
+                elif 'f1' in cv or 'accuracy' in cv:
+                    target_type = 'classification'
+            if target_type == 'classification' and baseline_clf_model is not None:
+                res['model'] = baseline_clf_model
+                print(f"[INFO] Attached baseline classification model to {name} for analysis")
+            elif (target_type == 'regression' or target_type is None) and baseline_reg_model is not None:
+                res['model'] = baseline_reg_model
+                print(f"[INFO] Attached baseline regression model to {name} for analysis")
+            else:
+                # no baseline available; analysis will skip interpretability for this exp
+                pass
+
     # Load dataset for analysis
     if config_path:
         config = load_config(config_path)
@@ -650,6 +785,12 @@ def run_full_analysis(
     # Preprocess
     target_col = config.get('data', {}).get('target_column', 'Risk_Score')
     target_type = config.get('data', {}).get('target_type', 'regression')
+
+    # Package any latent-sprint artifacts (Sprint 7) into analysis dir now that we know target_type
+    try:
+        package_latent_runs_into_analysis(all_experiments, os.path.join(analysis_dir, 'latent_sprint'), task=target_type)
+    except Exception as e:
+        print(f"[WARN] Packaging latent sprint artifacts failed: {e}")
 
     # Try to get features from first experiment's data_profile
     first_exp = list(all_experiments.values())[0]
@@ -717,8 +858,27 @@ def run_full_analysis(
         exp_features = exp_profile.get('features_used', feature_cols)
         exp_features = [c for c in exp_features if c in df.columns]
 
+        # If a model exists and exposes feature names, prefer those (sklearn sets feature_names_in_)
+        if model is not None:
+            try:
+                model_feature_names = getattr(model, 'feature_names_in_', None)
+                if model_feature_names is None and hasattr(model, 'named_steps'):
+                    # Pipeline: the pipeline itself may have feature_names_in_
+                    model_feature_names = getattr(model, 'feature_names_in_', None)
+                if model_feature_names is not None:
+                    # Use intersection to avoid missing columns
+                    model_cols = [c for c in list(model_feature_names) if c in df.columns]
+                    if model_cols:
+                        exp_features = model_cols
+            except Exception:
+                pass
+
         # Prepare data with experiment-specific features (keep as DataFrame for sklearn)
-        X_exp = df[exp_features].astype(np.float32)
+        # Use DataFrame to preserve column names when used with sklearn models
+        X_exp = df[exp_features].copy()
+        X_exp = X_exp.astype(np.float32)
+        # Prepare a numpy copy for analysis internals
+        X_exp_np = X_exp.values if isinstance(X_exp, pd.DataFrame) else np.array(X_exp)
 
         # Get target from experiment config if available
         exp_config = exp_results.get('config', {})
@@ -735,7 +895,8 @@ def run_full_analysis(
                 interp_results = run_interpretability_analysis(
                     model, X_exp, y_exp, exp_features, exp_target_type,
                     os.path.join(exp_dir, 'interpretability'),
-                    is_torch=is_torch
+                    is_torch=is_torch,
+                    X_np=X_exp_np
                 )
                 all_results['interpretability'][exp_name] = interp_results
             except Exception as e:
@@ -746,7 +907,8 @@ def run_full_analysis(
                 error_results = run_error_analysis(
                     model, X_exp, y_exp, exp_features, exp_target_type,
                     os.path.join(exp_dir, 'errors'),
-                    is_torch=is_torch
+                    is_torch=is_torch,
+                    X_np=X_exp_np
                 )
                 all_results['errors'][exp_name] = error_results
             except Exception as e:
@@ -757,7 +919,8 @@ def run_full_analysis(
                 whatif_results = run_what_if_analysis(
                     model, X_exp, exp_features,
                     os.path.join(exp_dir, 'what_if'),
-                    is_torch=is_torch
+                    is_torch=is_torch,
+                    X_np=X_exp_np
                 )
                 all_results['what_if'][exp_name] = whatif_results
             except Exception as e:

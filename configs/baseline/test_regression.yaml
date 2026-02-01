@@ -1,0 +1,27 @@
+experiment:
+  name: "test_baseline_regression"
+  seed: 42
+  output_dir: "runs"
+
+data:
+  dataset_path: "data/processed/1_encoded.csv"
+  target_column: "Risk_Score"
+  target_type: "regression"
+
+preprocessing:
+  ignored_columns:
+    - "Behavior_Risk_Level"
+  columns_to_drop:
+    - "Confidence"
+    - "Outlier"
+    - "Cluster"
+    - "Auto_Label"
+
+model:
+  type: "ridge"
+
+cross_validation:
+  enabled: true
+  n_splits: 2
+  n_repeats: 1
+  shuffle: true

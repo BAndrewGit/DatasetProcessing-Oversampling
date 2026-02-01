@@ -7,6 +7,7 @@ import numpy as np
 from sdv.single_table import CTGANSynthesizer
 from sdv.metadata import SingleTableMetadata
 import os
+from FirstProcessing.risk_calculation import calculate_risk_score
 os.environ["LOKY_MAX_CPU_COUNT"] = "4"
 
 if os.path.exists("global_risk_threshold.txt"):

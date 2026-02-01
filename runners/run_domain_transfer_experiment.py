@@ -18,7 +18,7 @@ import pandas as pd
 from sklearn.model_selection import RepeatedKFold
 from sklearn.preprocessing import StandardScaler
 
-from experiments.io import load_config, create_run_dir
+from experiments.io import load_config
 from experiments.config_schema import FORBIDDEN_TARGETS
 from experiments.domain_transfer import (
     train_adv_only,
@@ -73,18 +73,24 @@ def load_adv_data(config: dict, dataset_path: str = None) -> tuple:
     y_savings = df['Save_Money_Yes'].values.astype(np.float32)
 
     # Features - exclude targets and forbidden columns
-    ignored = config['preprocessing'].get('ignored_columns', [])
-    cols_to_drop = config['preprocessing'].get('columns_to_drop', [])
+    prep_cfg = config.get('preprocessing', {})
+    ignored = prep_cfg.get('ignored_columns', [])
+    cols_to_drop = prep_cfg.get('columns_to_drop', [])
 
     exclude = ['Risk_Score', 'Save_Money_Yes', 'Save_Money_No'] + ignored + cols_to_drop
     exclude = [c for c in exclude if c in df.columns]
 
     feature_cols = [c for c in df.columns if c not in exclude]
 
-    # Verify no forbidden columns
-    for col in feature_cols:
-        if col in FORBIDDEN_TARGETS:
-            raise ValueError(f"Forbidden column '{col}' in ADV features")
+    # Remove forbidden columns if present, but continue (log warning)
+    forbidden_in_features = [c for c in feature_cols if c in FORBIDDEN_TARGETS]
+    if forbidden_in_features:
+        print(f"[WARN] Found forbidden columns in ADV features: {forbidden_in_features}. They will be removed from features.")
+        feature_cols = [c for c in feature_cols if c not in FORBIDDEN_TARGETS]
+
+    # Final check - if no features left, raise
+    if not feature_cols:
+        raise ValueError("No valid ADV features remain after removing forbidden columns and exclusions")
 
     X = df[feature_cols].values.astype(np.float32)
 
@@ -180,6 +186,7 @@ def run_domain_transfer_cv(
 
     total_folds = n_splits * n_repeats
 
+    saved_models = {'adv_only_models': [], 'transfer_models': [], 'adv_scalers': [], 'gmsc_scalers': []}
     for fold_idx, (train_idx, val_idx) in enumerate(cv.split(adv_X)):
         print(f"\nFold {fold_idx + 1}/{total_folds}")
 
@@ -200,22 +207,27 @@ def run_domain_transfer_cv(
 
         # Experiment 1: ADV-only
         print("  Training ADV-only model...")
-        adv_metrics = train_adv_only(
+        adv_metrics, adv_model = train_adv_only(
             adv_X_train_s, adv_y_risk_train, adv_y_savings_train,
             adv_X_val_s, adv_y_risk_val, adv_y_savings_val,
             model_config, fold_seed
         )
         adv_only_metrics.append(adv_metrics)
+        saved_models['adv_only_models'].append(adv_model)
+        # save scalers for this fold
+        saved_models['adv_scalers'].append(adv_scaler)
+        saved_models['gmsc_scalers'].append(gmsc_scaler)
 
         # Experiment 2: ADV + GMSC transfer
         print("  Training ADV + GMSC transfer model...")
-        transfer_m = train_with_gmsc_transfer(
+        transfer_m, transfer_model = train_with_gmsc_transfer(
             adv_X_train_s, adv_y_risk_train, adv_y_savings_train,
             adv_X_val_s, adv_y_risk_val, adv_y_savings_val,
             gmsc_X_s, gmsc_y,
             model_config, fold_seed
         )
         transfer_metrics.append(transfer_m)
+        saved_models['transfer_models'].append(transfer_model)
 
         # Progress report
         print(f"  ADV-only:  Risk MAE={adv_metrics['risk_mae']:.4f}, "
@@ -226,7 +238,8 @@ def run_domain_transfer_cv(
     # Aggregate results
     results = {
         'adv_only': _aggregate_metrics(adv_only_metrics),
-        'transfer': _aggregate_metrics(transfer_metrics)
+        'transfer': _aggregate_metrics(transfer_metrics),
+        'saved_models': saved_models
     }
 
     return results
@@ -374,22 +387,18 @@ def analyze_transfer_benefit(results: dict) -> dict:
     return analysis
 
 
-def run_domain_transfer_experiment(config_path: str, adv_path: str = None, gmsc_path: str = None):
+def run_domain_transfer_experiment(config_path: str, adv_path: str = None, gmsc_path: str = None, output_dir: str = None):
     """
     Run full domain transfer experiment.
-
-    Args:
-        config_path: Path to config YAML
-        adv_path: Optional path to ADV dataset (overrides config)
-        gmsc_path: Optional path to GMSC dataset (overrides config)
-
-    Returns:
-        run_dir: Path to experiment output directory
     """
     # Load config
     config = load_config(config_path)
 
-    seed = config['experiment']['seed']
+    # Override output_dir if provided
+    if output_dir:
+        config.setdefault('experiment', {})['output_dir'] = output_dir
+
+    seed = config.get('experiment', {}).get('seed', 42)
     set_seeds(seed)
 
     print("=" * 90)
@@ -451,6 +460,9 @@ def run_domain_transfer_experiment(config_path: str, adv_path: str = None, gmsc_
     run_dir = os.path.join(output_dir, f"domain_transfer_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
 
+    # Prepare results without non-serializable objects
+    results_for_json = {k: v for k, v in results.items() if k != 'saved_models'}
+
     # Save full results
     results_json = {
         'experiment': 'domain_transfer',
@@ -462,7 +474,7 @@ def run_domain_transfer_experiment(config_path: str, adv_path: str = None, gmsc_
         'gmsc_samples': len(gmsc_X),
         'adv_ratio': config['data'].get('adv_ratio', 0.7),
         'alignment_method': config.get('domain_alignment', {}).get('method', 'coral'),
-        'results': results,
+        'results': results_for_json,
         'analysis': analysis,
         'verdict': verdict
     }
@@ -475,22 +487,51 @@ def run_domain_transfer_experiment(config_path: str, adv_path: str = None, gmsc_
     with open(os.path.join(run_dir, 'config.yaml'), 'w') as f:
         yaml.dump(config, f, default_flow_style=False)
 
+    # Save PyTorch models returned by training (if present)
+    try:
+        saved = results.get('saved_models', {})
+        adv_models = saved.get('adv_only_models', [])
+        transfer_models = saved.get('transfer_models', [])
+        adv_scalers = saved.get('adv_scalers', [])
+        gmsc_scalers = saved.get('gmsc_scalers', [])
+        import torch as _torch
+        import joblib as _joblib
+        # Save the last model of each list if available
+        if adv_models:
+            _torch.save(adv_models[-1].state_dict(), os.path.join(run_dir, 'adv_only_model.pth'))
+        if transfer_models:
+            _torch.save(transfer_models[-1].state_dict(), os.path.join(run_dir, 'transfer_model.pth'))
+        # Save last scalers as joblib for analysis
+        if adv_scalers:
+            try:
+                _joblib.dump(adv_scalers[-1], os.path.join(run_dir, 'adv_scaler.joblib'))
+            except Exception:
+                pass
+        if gmsc_scalers:
+            try:
+                _joblib.dump(gmsc_scalers[-1], os.path.join(run_dir, 'gmsc_scaler.joblib'))
+            except Exception:
+                pass
+        # Write small metadata file
+        try:
+            from experiments.save_model import write_model_metadata
+            metadata = {
+                'pytorch_state_dicts': {
+                    'adv_only': 'adv_only_model.pth' if adv_models else None,
+                    'transfer': 'transfer_model.pth' if transfer_models else None
+                },
+                'sklearn_objects': {
+                    'adv_scaler': 'adv_scaler.joblib' if adv_scalers else None,
+                    'gmsc_scaler': 'gmsc_scaler.joblib' if gmsc_scalers else None
+                }
+            }
+            write_model_metadata(run_dir, metadata)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"Warning: failed to save torch models: {e}")
+
     print(f"\nResults saved to: {run_dir}")
 
     return run_dir, verdict, results
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Domain transfer experiment: ADV + GMSC')
-    parser.add_argument('--config', '-c', type=str,
-                        default='configs/domain_transfer_experiment.yaml',
-                        help='Path to config YAML')
-    parser.add_argument('--adv', type=str, default=None,
-                        help='Path to ADV dataset (overrides config)')
-    parser.add_argument('--gmsc', type=str, default=None,
-                        help='Path to GMSC dataset (overrides config)')
-
-    args = parser.parse_args()
-
-    run_domain_transfer_experiment(args.config, args.adv, args.gmsc)
 

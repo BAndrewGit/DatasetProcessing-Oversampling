@@ -709,7 +709,8 @@ def train_adv_only(X_train: np.ndarray, y_risk_train: np.ndarray, y_savings_trai
         max_epochs=config.get('max_epochs', 100)
     )
 
-    return metrics
+    # Return metrics and trained model for downstream saving
+    return metrics, trainer.model
 
 
 def train_with_gmsc_transfer(
@@ -800,5 +801,4 @@ def train_with_gmsc_transfer(
         max_epochs=config.get('max_epochs', 100)
     )
 
-    return metrics
-
+    return metrics, trainer.model

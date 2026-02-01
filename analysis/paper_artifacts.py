@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from typing import Dict, List, Optional, Tuple, Any
 import json
+import os
 from datetime import datetime
 
 
@@ -451,7 +452,6 @@ def export_final_figures(
     Returns:
         List of saved file paths
     """
-    import os
     os.makedirs(output_dir, exist_ok=True)
 
     saved_files = []
@@ -539,4 +539,240 @@ def create_results_summary(
         json.dump(summary, f, indent=2, default=str)
 
     return output_path
+
+
+# -----------------------------------------------------------------------------
+# Sprint 7: Latent sampling -> paper artifacts helpers
+# -----------------------------------------------------------------------------
+def generate_evr_plot(pca_selection: Dict[str, Any], save_path: str) -> None:
+    """Generate EVR curve plot from pca_selection.json content."""
+    try:
+        candidates = pca_selection.get('candidates', {})
+        ks = []
+        evrs = []
+        for kname, info in candidates.items():
+            # kname might be like '10_false' or just '10'
+            try:
+                k = int(kname.split('_')[0])
+            except Exception:
+                continue
+            ks.append(k)
+            evrs.append(float(info.get('evr', 0.0)))
+        if not ks:
+            return
+        # sort by k
+        order = sorted(range(len(ks)), key=lambda i: ks[i])
+        ks_s = [ks[i] for i in order]
+        evr_s = [evrs[i] for i in order]
+        plt.figure(figsize=(5,3))
+        plt.plot(ks_s, evr_s, marker='o')
+        plt.xlabel('k (PCA components)')
+        plt.ylabel('Explained variance ratio (EVR)')
+        plt.title('PCA EVR selection')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close()
+    except Exception:
+        pass
+
+
+def generate_performance_vs_synth_plot(perf_rows: List[Dict[str, Any]], task: str, save_path: str) -> None:
+    """Generate performance vs synth count plot from perf_rows (list of dicts)."""
+    try:
+        # build mapping of synth_count -> metric
+        synths = []
+        metrics = []
+        primary = 'mae' if task == 'regression' else 'macro_f1'
+        for r in perf_rows:
+            sc = int(r.get('synth_count', 0))
+            val = r.get(primary, None)
+            synths.append(sc)
+            metrics.append(val)
+        if not synths:
+            return
+        # sort
+        pairs = sorted(zip(synths, metrics), key=lambda x: x[0])
+        xs = [p[0] for p in pairs]
+        ys = [p[1] for p in pairs]
+        plt.figure(figsize=(6,3))
+        if task == 'regression':
+            plt.plot(xs, ys, marker='o')
+            plt.gca().invert_yaxis()  # lower MAE better -> visualize downward trend
+            plt.ylabel('MAE (lower better)')
+        else:
+            plt.plot(xs, ys, marker='o')
+            plt.ylabel('Macro-F1 (higher better)')
+        plt.xlabel('Synth count')
+        plt.title('Performance vs synth count (fold-level)')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close()
+    except Exception:
+        pass
+
+
+def package_latent_sprint_artifacts(run_results: Dict[str, Any], run_dir: str, out_dir: str, task: str = 'regression') -> Dict[str, Any]:
+    """
+    Given run_results (as returned by load_experiment_results), assemble Sprint 7 artifacts into out_dir.
+    Returns a small summary dict (ablation row) suitable for `generate_ablation_table`.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    summary = {}
+    # Use latent_sprint summary collected by load_experiment_results if available
+    latent_summary = run_results.get('latent_sprint') if isinstance(run_results, dict) else None
+    pca_sel = None
+    perf_rows = None
+    cluster_scatter_src = None
+    # If latent_summary exists, prefer files listed there (they may point to fold-level artifacts)
+    if latent_summary:
+        # pca_selection may be at root or in folds; take first available
+        pca_sel = None
+        if latent_summary.get('pca_selection') and os.path.exists(latent_summary.get('pca_selection')):
+            try:
+                with open(latent_summary.get('pca_selection')) as f:
+                    pca_sel = json.load(f)
+                evr_plot = os.path.join(out_dir, 'pca_evr.png')
+                generate_evr_plot(pca_sel, evr_plot)
+                summary['pca_evr'] = evr_plot
+            except Exception:
+                pca_sel = None
+
+        # performance CSV: prefer root, else first fold
+        perf_csv_candidate = latent_summary.get('performance_csv')
+        if perf_csv_candidate and os.path.exists(perf_csv_candidate):
+            perf_csv = perf_csv_candidate
+        else:
+            # search folds
+            perf_csv = None
+            for fold_entry in latent_summary.get('folds', []):
+                if fold_entry.get('performance_csv') and os.path.exists(fold_entry.get('performance_csv')):
+                    perf_csv = fold_entry.get('performance_csv')
+                    break
+
+        if perf_csv:
+            try:
+                import csv
+                with open(perf_csv, 'r', newline='') as f:
+                    reader = csv.DictReader(f)
+                    perf_rows = [dict(r) for r in reader]
+                # convert numeric fields where possible
+                for r in perf_rows:
+                    if 'synth_count' in r:
+                        try:
+                            r['synth_count'] = int(r['synth_count'])
+                        except Exception:
+                            pass
+                    primary = 'mae' if task == 'regression' else 'macro_f1'
+                    if primary in r and r[primary] not in (None, '', 'None'):
+                        try:
+                            r[primary] = float(r[primary])
+                        except Exception:
+                            try:
+                                import json as _j
+                                r[primary] = float(_j.loads(r[primary]))
+                            except Exception:
+                                r[primary] = None
+            except Exception:
+                perf_rows = None
+
+        # cluster scatter
+        cluster_scatter_src = latent_summary.get('cluster_scatter') or None
+        if not cluster_scatter_src:
+            # try fold entries
+            for fe in latent_summary.get('folds', []):
+                if fe.get('cluster_scatter') and os.path.exists(fe.get('cluster_scatter')):
+                    cluster_scatter_src = fe.get('cluster_scatter')
+                    break
+        if cluster_scatter_src:
+            try:
+                dst = os.path.join(out_dir, 'latent_cluster_scatter.png')
+                import shutil
+                shutil.copyfile(cluster_scatter_src, dst)
+                summary['latent_scatter'] = dst
+            except Exception:
+                pass
+
+    # Fallback: previous behavior that looked for artifacts in run_dir root
+    if pca_sel is None:
+        pca_sel_path = os.path.join(run_dir, 'pca_selection.json')
+        if os.path.exists(pca_sel_path):
+            try:
+                with open(pca_sel_path) as f:
+                    pca_sel = json.load(f)
+                evr_plot = os.path.join(out_dir, 'pca_evr.png')
+                generate_evr_plot(pca_sel, evr_plot)
+                summary['pca_evr'] = evr_plot
+            except Exception:
+                pass
+
+    # If perf_rows still None, try to load performance CSV at run_dir root
+    if perf_rows is None:
+        perf_csv = os.path.join(run_dir, 'performance_vs_synth_count.csv')
+        if os.path.exists(perf_csv):
+            try:
+                import csv
+                with open(perf_csv, 'r', newline='') as f:
+                    reader = csv.DictReader(f)
+                    perf_rows = [dict(r) for r in reader]
+                for r in perf_rows:
+                    if 'synth_count' in r:
+                        try:
+                            r['synth_count'] = int(r['synth_count'])
+                        except Exception:
+                            pass
+                    primary = 'mae' if task == 'regression' else 'macro_f1'
+                    if primary in r and r[primary] not in (None, '', 'None'):
+                        try:
+                            r[primary] = float(r[primary])
+                        except Exception:
+                            try:
+                                import json as _j
+                                r[primary] = float(_j.loads(r[primary]))
+                            except Exception:
+                                r[primary] = None
+            except Exception:
+                perf_rows = None
+
+    if perf_rows is None:
+        # Try metrics
+        metrics = run_results.get('metrics', {})
+        perf_rows = metrics.get('performance_vs_synth') if isinstance(metrics, dict) else None
+
+    if perf_rows:
+        perf_plot = os.path.join(out_dir, 'performance_vs_synth_count.png')
+        generate_performance_vs_synth_plot(perf_rows, task, perf_plot)
+        summary['performance_plot'] = perf_plot
+        # create ablation row: baseline vs best_aug
+        # baseline = row with synth_count==0
+        baseline_row = next((r for r in perf_rows if int(r.get('synth_count', 0)) == 0), None)
+        accepted_rows = [r for r in perf_rows if r.get('accepted')]
+        best_aug = None
+        if accepted_rows:
+            primary = 'mae' if task == 'regression' else 'macro_f1'
+            try:
+                if task == 'regression':
+                    best_aug = min((r for r in accepted_rows if r.get(primary) is not None), key=lambda x: float(x.get(primary)))
+                else:
+                    best_aug = max((r for r in accepted_rows if r.get(primary) is not None), key=lambda x: float(x.get(primary)))
+            except Exception:
+                best_aug = None
+
+        ablation_row = {
+            'baseline_mean': float(baseline_row.get('mae' if task=='regression' else 'macro_f1')) if baseline_row else None,
+            'best_aug_mean': float(best_aug.get('mae' if task=='regression' else 'macro_f1')) if best_aug else None,
+            'n_synth_generated': int(best_aug.get('n_synth_generated')) if best_aug and best_aug.get('n_synth_generated') is not None else 0,
+            'accepted': bool(best_aug is not None)
+        }
+        summary['ablation_row'] = ablation_row
+
+    # Save summary json
+    try:
+        with open(os.path.join(out_dir, 'latent_sprint_summary.json'), 'w') as f:
+            json.dump(summary, f, indent=2)
+    except Exception:
+        pass
+
+    return summary
 

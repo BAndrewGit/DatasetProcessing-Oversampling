@@ -33,19 +33,24 @@ def set_seeds(seed):
         pass
 
 
-def run_baseline(config_path, dataset_path=None):
+def run_baseline(config_path, dataset_path=None, output_dir=None):
     """
     Run a clean baseline experiment (NO augmentation).
 
     Args:
         config_path: Path to YAML config file
         dataset_path: Optional path to dataset CSV (overrides config)
+        output_dir: Optional output directory (overrides config)
 
     Returns:
         run_dir: Path to experiment output directory
     """
     # Load and validate config
     config = load_config(config_path)
+
+    # Override output_dir if provided
+    if output_dir:
+        config['experiment']['output_dir'] = output_dir
 
     try:
         validate_baseline_config(config)
