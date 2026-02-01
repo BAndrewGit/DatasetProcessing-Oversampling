@@ -144,10 +144,24 @@ def run_full_pipeline(
     print(f"\n>>> Dataset: {dataset_path}")
 
     results = {
-        'preprocessing': None, 'baseline_regression': None, 'baseline_classification': None,
+        'preprocessing': None, 'eda': None, 'baseline_regression': None, 'baseline_classification': None,
         'augmentation': None, 'multitask': None, 'domain_transfer': None, 'analysis': None, 'tests': None
     }
     run_dirs = []
+
+    # STEP 0: EDA (Exploratory Data Analysis)
+    print_step(0, "EXPLORATORY DATA ANALYSIS")
+    try:
+        from runners.run_eda import run_eda
+        eda_dir = os.path.join(PIPELINE_RUN_DIR, 'eda')
+        summary = run_eda(dataset_path, eda_dir, target_col='Risk_Score', task='regression')
+        results['eda'] = eda_dir
+        print(f"[OK] EDA plots saved to: {eda_dir}")
+        print(f"    Generated {len(summary.get('plots_generated', []))} plots")
+    except Exception as e:
+        import traceback
+        print(f"[WARN] EDA failed: {e}")
+        traceback.print_exc()
 
     # STEP 1: Baseline (Sprint 1)
     if not skip_baseline:

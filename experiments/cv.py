@@ -88,7 +88,16 @@ def run_repeated_cv_regression(model, X, y, config):
 
         mae_scores.append(mean_absolute_error(y_val, y_pred))
         rmse_scores.append(np.sqrt(mean_squared_error(y_val, y_pred)))
-        spearman_scores.append(spearmanr(y_val, y_pred)[0])
+
+        # Handle constant arrays for Spearman correlation
+        if np.std(y_val) > 1e-8 and np.std(y_pred) > 1e-8:
+            try:
+                spearman_scores.append(spearmanr(y_val, y_pred)[0])
+            except Exception:
+                spearman_scores.append(0.0)
+        else:
+            spearman_scores.append(0.0)
+
         r2_scores.append(r2_score(y_val, y_pred))
 
     return {

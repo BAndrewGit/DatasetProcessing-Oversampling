@@ -263,7 +263,15 @@ def run_augmentation_experiment(config_path, dataset_path=None, output_dir=None,
 
             results_real_only['mae'].append(mean_absolute_error(y_test, pred_real))
             results_real_only['rmse'].append(np.sqrt(mean_squared_error(y_test, pred_real)))
-            results_real_only['spearman'].append(spearmanr(y_test, pred_real)[0])
+
+            # Handle constant arrays for Spearman
+            if np.std(y_test) > 1e-8 and np.std(pred_real) > 1e-8:
+                try:
+                    results_real_only['spearman'].append(spearmanr(y_test, pred_real)[0])
+                except Exception:
+                    results_real_only['spearman'].append(0.0)
+            else:
+                results_real_only['spearman'].append(0.0)
         else:
             model_real = LogisticRegression(class_weight='balanced', random_state=seed, max_iter=1000)
             model_real.fit(X_train_s_df, y_train)
@@ -318,7 +326,15 @@ def run_augmentation_experiment(config_path, dataset_path=None, output_dir=None,
 
                 results_augmented['mae'].append(mean_absolute_error(y_test, pred_aug))
                 results_augmented['rmse'].append(np.sqrt(mean_squared_error(y_test, pred_aug)))
-                results_augmented['spearman'].append(spearmanr(y_test, pred_aug)[0])
+
+                # Handle constant arrays for Spearman
+                if np.std(y_test) > 1e-8 and np.std(pred_aug) > 1e-8:
+                    try:
+                        results_augmented['spearman'].append(spearmanr(y_test, pred_aug)[0])
+                    except Exception:
+                        results_augmented['spearman'].append(0.0)
+                else:
+                    results_augmented['spearman'].append(0.0)
             else:
                 model_aug = LogisticRegression(class_weight='balanced', random_state=seed, max_iter=1000)
                 # X_train_aug_df already created above

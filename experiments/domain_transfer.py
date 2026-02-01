@@ -6,7 +6,16 @@
 # - NO dataset merging (separate feature spaces)
 # - Loss masking: GMSC does not update savings head
 # - Evaluation on ADV real data only
-# - Optional CORAL/MMD alignment
+# - Optional CORAL/MMD alignment (scheduled, not from epoch 0)
+#
+# FIXES IMPLEMENTED:
+# - pos_weight for GMSC class imbalance
+# - DataLoader with reshuffle each epoch (not static batches)
+# - Warmup ADV-only epochs before GMSC
+# - Optional trunk freeze when GMSC starts
+# - Ablation modes (A1, A2, A3)
+# - Gradient norm logging for debugging
+# - Scheduled alignment weight
 
 import numpy as np
 import torch
@@ -19,6 +28,30 @@ from sklearn.metrics import (
 )
 from scipy.stats import spearmanr
 from typing import Tuple, Dict, Optional, List
+import random
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def set_requires_grad(module: nn.Module, requires_grad: bool):
+    """Enable/disable gradients for a module."""
+    for param in module.parameters():
+        param.requires_grad = requires_grad
+
+
+def compute_grad_norm(model: nn.Module, prefix: str = '') -> Dict[str, float]:
+    """Compute gradient norms for model components."""
+    norms = {}
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            norm = param.grad.norm().item()
+            if prefix:
+                norms[f'{prefix}_{name}'] = norm
+            else:
+                norms[name] = norm
+    return norms
 
 
 # =============================================================================
@@ -72,6 +105,7 @@ class MixedDomainSampler(Sampler):
     """
     Sampler that creates mixed-domain batches with fixed ratio.
     E.g., 70% ADV / 30% GMSC samples per batch.
+    Reshuffles each time __iter__ is called (each epoch).
     """
 
     def __init__(self, adv_size: int, gmsc_size: int, batch_size: int,
@@ -80,7 +114,8 @@ class MixedDomainSampler(Sampler):
         self.gmsc_size = gmsc_size
         self.batch_size = batch_size
         self.adv_ratio = adv_ratio
-        self.seed = seed
+        self.base_seed = seed
+        self.epoch = 0
 
         # Calculate samples per domain per batch
         self.adv_per_batch = int(batch_size * adv_ratio)
@@ -89,8 +124,13 @@ class MixedDomainSampler(Sampler):
         # Total batches based on ADV dataset (primary)
         self.n_batches = adv_size // self.adv_per_batch
 
+    def set_epoch(self, epoch: int):
+        """Set epoch for deterministic but different shuffle each epoch."""
+        self.epoch = epoch
+
     def __iter__(self):
-        rng = np.random.RandomState(self.seed)
+        # Use epoch-dependent seed for different shuffle each epoch
+        rng = np.random.RandomState(self.base_seed + self.epoch)
 
         # Shuffle indices for each domain
         adv_indices = rng.permutation(self.adv_size)
@@ -367,15 +407,15 @@ def coral_loss(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     # Source covariance
     source_mean = source.mean(0, keepdim=True)
     source_centered = source - source_mean
-    source_cov = source_centered.t() @ source_centered / (source.size(0) - 1)
+    source_cov = source_centered.t() @ source_centered / (source.size(0) - 1 + 1e-8)
 
     # Target covariance
     target_mean = target.mean(0, keepdim=True)
     target_centered = target - target_mean
-    target_cov = target_centered.t() @ target_centered / (target.size(0) - 1)
+    target_cov = target_centered.t() @ target_centered / (target.size(0) - 1 + 1e-8)
 
     # Frobenius norm of covariance difference
-    loss = (source_cov - target_cov).pow(2).sum() / (4 * d * d)
+    loss = (source_cov - target_cov).pow(2).sum() / (4 * d * d + 1e-8)
 
     return loss
 
@@ -405,7 +445,7 @@ def mmd_loss(source: torch.Tensor, target: torch.Tensor,
 
 
 # =============================================================================
-# TRAINER
+# TRAINER (FIXED VERSION)
 # =============================================================================
 
 class DomainTransferTrainer:
@@ -413,13 +453,17 @@ class DomainTransferTrainer:
     Trainer for domain transfer model.
 
     Handles:
-    - Mixed-domain batches
+    - Mixed-domain batches with proper reshuffling
     - Loss masking (GMSC doesn't update savings head)
-    - Optional domain alignment
+    - Optional domain alignment (scheduled)
     - ADV-only evaluation
+    - Warmup ADV-only epochs
+    - Optional trunk freeze when GMSC starts
+    - pos_weight for GMSC class imbalance
     """
 
-    def __init__(self, model: DomainTransferModel, config: Dict, device: str = 'cpu'):
+    def __init__(self, model: DomainTransferModel, config: Dict, device: str = 'cpu',
+                 gmsc_pos_weight: Optional[torch.Tensor] = None):
         self.model = model.to(device)
         self.device = device
         self.config = config
@@ -438,18 +482,31 @@ class DomainTransferTrainer:
         else:
             self.adv_risk_loss_fn = nn.MSELoss()
 
-        self.gmsc_risk_loss_fn = nn.BCEWithLogitsLoss()
+        # GMSC BCE with pos_weight for class imbalance (FIX 2.1)
+        if gmsc_pos_weight is not None:
+            self.gmsc_risk_loss_fn = nn.BCEWithLogitsLoss(pos_weight=gmsc_pos_weight.to(device))
+        else:
+            self.gmsc_risk_loss_fn = nn.BCEWithLogitsLoss()
+
         self.savings_loss_fn = nn.BCEWithLogitsLoss()
 
-        # Loss weights
+        # Loss weights (FIX 2.2: default gmsc_risk_weight is now 0.05, not 0.5)
         self.adv_risk_weight = config.get('adv_risk_weight', 1.0)
-        self.gmsc_risk_weight = config.get('gmsc_risk_weight', 0.5)
+        self.gmsc_risk_weight = config.get('gmsc_risk_weight', 0.05)  # REDUCED!
         self.savings_weight = config.get('savings_weight', 1.0)
 
-        # Domain alignment
+        # Domain alignment (FIX 2.3 & 6: disabled by default, scheduled)
         self.alignment_enabled = config.get('alignment_enabled', False)
         self.alignment_method = config.get('alignment_method', 'coral')
-        self.alignment_weight = config.get('alignment_weight', 0.1)
+        self.alignment_weight = config.get('alignment_weight', 0.01)  # REDUCED!
+        self.alignment_start_epoch = config.get('alignment_start_epoch', 20)  # Don't start from epoch 0!
+        self.alignment_max_weight = config.get('alignment_max_weight', 0.05)
+
+        # Warmup (FIX 4.1)
+        self.warmup_epochs = config.get('warmup_epochs', 10)
+
+        # Trunk freeze when GMSC starts (FIX 4.2)
+        self.freeze_trunk_epochs = config.get('freeze_trunk_epochs', 5)
 
         # Gradient clipping
         self.clip_grad = config.get('clip_grad', 1.0)
@@ -457,7 +514,26 @@ class DomainTransferTrainer:
         # Early stopping
         self.patience = config.get('patience', 15)
 
-    def train_step(self, adv_batch: Optional[Dict], gmsc_batch: Optional[Dict]) -> Dict:
+        # Logging
+        self.log_gradients = config.get('log_gradients', False)
+        self.epoch_logs = []
+
+    def _get_scheduled_alignment_weight(self, epoch: int) -> float:
+        """Get alignment weight with schedule (FIX 6.2)."""
+        if not self.alignment_enabled:
+            return 0.0
+        if epoch < self.alignment_start_epoch:
+            return 0.0
+
+        # Linear ramp-up
+        epochs_since_start = epoch - self.alignment_start_epoch
+        ramp_epochs = 10  # Ramp up over 10 epochs
+        if epochs_since_start < ramp_epochs:
+            return self.alignment_weight * (epochs_since_start / ramp_epochs)
+        return min(self.alignment_weight, self.alignment_max_weight)
+
+    def train_step(self, adv_batch: Optional[Dict], gmsc_batch: Optional[Dict],
+                   epoch: int = 0, use_gmsc: bool = True) -> Dict:
         """Single training step with mixed-domain batch."""
         self.model.train()
         self.optimizer.zero_grad()
@@ -489,8 +565,8 @@ class DomainTransferTrainer:
 
             adv_shared = adv_output['shared']
 
-        # Process GMSC batch
-        if gmsc_batch is not None:
+        # Process GMSC batch (only if use_gmsc=True, i.e., not in warmup)
+        if gmsc_batch is not None and use_gmsc and self.gmsc_risk_weight > 0:
             gmsc_features = gmsc_batch['features'].to(self.device)
             gmsc_risk_target = gmsc_batch['risk_target'].to(self.device)
 
@@ -504,28 +580,40 @@ class DomainTransferTrainer:
 
             gmsc_shared = gmsc_output['shared']
 
-        # Domain alignment loss
-        if self.alignment_enabled and adv_shared is not None and gmsc_shared is not None:
+        # Domain alignment loss (scheduled)
+        current_align_weight = self._get_scheduled_alignment_weight(epoch)
+        if current_align_weight > 0 and adv_shared is not None and gmsc_shared is not None:
             if self.alignment_method == 'coral':
                 align_loss = coral_loss(adv_shared, gmsc_shared)
             elif self.alignment_method == 'mmd':
                 align_loss = mmd_loss(adv_shared, gmsc_shared)
             else:
-                align_loss = torch.tensor(0.0)
+                align_loss = torch.tensor(0.0, device=self.device)
 
-            total_loss += self.alignment_weight * align_loss
+            total_loss += current_align_weight * align_loss
             loss_components['alignment'] = align_loss.item()
+            loss_components['alignment_weight'] = current_align_weight
 
         # Backward pass
-        total_loss.backward()
+        if total_loss.requires_grad:
+            total_loss.backward()
 
-        # Gradient clipping
-        if self.clip_grad is not None:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
+            # Gradient clipping
+            if self.clip_grad is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
 
-        self.optimizer.step()
+            # Log gradient norms if requested (FIX 7)
+            if self.log_gradients:
+                trunk_grad_norm = 0.0
+                for param in self.model.shared_trunk.parameters():
+                    if param.grad is not None:
+                        trunk_grad_norm += param.grad.norm().item() ** 2
+                trunk_grad_norm = trunk_grad_norm ** 0.5
+                loss_components['trunk_grad_norm'] = trunk_grad_norm
 
-        loss_components['total'] = total_loss.item()
+            self.optimizer.step()
+
+        loss_components['total'] = total_loss.item() if hasattr(total_loss, 'item') else float(total_loss)
         return loss_components
 
     def evaluate_adv(self, adv_loader: DataLoader) -> Dict:
@@ -583,7 +671,7 @@ class DomainTransferTrainer:
         else:
             metrics['risk_spearman'] = 0.0
 
-        # R² score
+        # R2 score
         ss_res = np.sum((y_risk_true - y_risk_pred) ** 2)
         ss_tot = np.sum((y_risk_true - np.mean(y_risk_true)) ** 2)
         metrics['risk_r2'] = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
@@ -602,14 +690,19 @@ class DomainTransferTrainer:
 
         return metrics
 
-    def fit(self, train_batches: List, adv_val_loader: DataLoader,
-            max_epochs: int = 100) -> Dict:
+    def fit_with_dataloaders(self, adv_train_loader: DataLoader, adv_val_loader: DataLoader,
+                             gmsc_train_loader: Optional[DataLoader] = None,
+                             max_epochs: int = 100) -> Dict:
         """
-        Train model with early stopping based on ADV validation loss.
+        Train model with proper DataLoaders (reshuffled each epoch).
+
+        FIX 3: Uses DataLoaders instead of static batch lists.
+        FIX 4: Implements warmup ADV-only + optional trunk freeze.
 
         Args:
-            train_batches: List of (adv_batch, gmsc_batch) tuples
+            adv_train_loader: DataLoader for ADV training data
             adv_val_loader: DataLoader for ADV validation data
+            gmsc_train_loader: DataLoader for GMSC training data (optional)
             max_epochs: Maximum training epochs
 
         Returns:
@@ -619,12 +712,44 @@ class DomainTransferTrainer:
         patience_counter = 0
         best_metrics = None
         best_state = None
+        trunk_frozen = False
+        trunk_was_frozen = False  # Track if we've already done the freeze cycle
 
         for epoch in range(max_epochs):
+            # Determine if we're in warmup phase (FIX 4.1)
+            in_warmup = epoch < self.warmup_epochs
+            use_gmsc = not in_warmup and gmsc_train_loader is not None
+
+            # Freeze/unfreeze trunk logic (FIX 4.2) - only do this ONCE
+            if use_gmsc and not trunk_was_frozen and self.freeze_trunk_epochs > 0:
+                # Just exited warmup - freeze trunk
+                set_requires_grad(self.model.shared_trunk, False)
+                trunk_frozen = True
+                trunk_was_frozen = True
+                print(f"  Epoch {epoch+1}: Freezing trunk for {self.freeze_trunk_epochs} epochs")
+
+            if trunk_frozen and epoch >= self.warmup_epochs + self.freeze_trunk_epochs:
+                # Unfreeze trunk after freeze period
+                set_requires_grad(self.model.shared_trunk, True)
+                trunk_frozen = False
+                print(f"  Epoch {epoch+1}: Unfreezing trunk")
+
             # Training
             epoch_losses = []
-            for adv_batch, gmsc_batch in train_batches:
-                loss_components = self.train_step(adv_batch, gmsc_batch)
+            gmsc_iter = iter(gmsc_train_loader) if use_gmsc else None
+
+            for adv_batch in adv_train_loader:
+                # Get GMSC batch if available
+                gmsc_batch = None
+                if gmsc_iter is not None:
+                    try:
+                        gmsc_batch = next(gmsc_iter)
+                    except StopIteration:
+                        # Restart GMSC iterator
+                        gmsc_iter = iter(gmsc_train_loader)
+                        gmsc_batch = next(gmsc_iter)
+
+                loss_components = self.train_step(adv_batch, gmsc_batch, epoch=epoch, use_gmsc=use_gmsc)
                 epoch_losses.append(loss_components['total'])
 
             avg_train_loss = np.mean(epoch_losses)
@@ -632,6 +757,63 @@ class DomainTransferTrainer:
             # Validation (ADV only)
             val_metrics = self.evaluate_adv(adv_val_loader)
             val_loss = val_metrics['risk_mae']  # Use MAE as validation criterion
+
+            # Log epoch
+            epoch_log = {
+                'epoch': epoch + 1,
+                'train_loss': avg_train_loss,
+                'val_mae': val_metrics['risk_mae'],
+                'val_f1': val_metrics['savings_macro_f1'],
+                'in_warmup': in_warmup,
+                'use_gmsc': use_gmsc
+            }
+            self.epoch_logs.append(epoch_log)
+
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_metrics = val_metrics
+                best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= self.patience:
+                print(f"Early stopping at epoch {epoch + 1}")
+                break
+
+        # Restore best model
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+
+        return best_metrics
+
+    def fit(self, train_batches: List, adv_val_loader: DataLoader,
+            max_epochs: int = 100) -> Dict:
+        """
+        Legacy fit method for backward compatibility.
+        Note: train_batches is static - prefer fit_with_dataloaders.
+        """
+        best_val_loss = float('inf')
+        patience_counter = 0
+        best_metrics = None
+        best_state = None
+
+        for epoch in range(max_epochs):
+            in_warmup = epoch < self.warmup_epochs
+
+            # Training
+            epoch_losses = []
+            for adv_batch, gmsc_batch in train_batches:
+                use_gmsc = not in_warmup and gmsc_batch is not None
+                loss_components = self.train_step(adv_batch, gmsc_batch, epoch=epoch, use_gmsc=use_gmsc)
+                epoch_losses.append(loss_components['total'])
+
+            avg_train_loss = np.mean(epoch_losses)
+
+            # Validation (ADV only)
+            val_metrics = self.evaluate_adv(adv_val_loader)
+            val_loss = val_metrics['risk_mae']
 
             # Early stopping
             if val_loss < best_val_loss:
@@ -654,20 +836,38 @@ class DomainTransferTrainer:
 
 
 # =============================================================================
-# TRAINING FUNCTIONS
+# TRAINING FUNCTIONS (FIXED)
 # =============================================================================
+
+def compute_gmsc_pos_weight(gmsc_y: np.ndarray) -> torch.Tensor:
+    """
+    Compute pos_weight for GMSC BCE loss to handle class imbalance.
+    FIX 2.1: Properly weight the minority class.
+    """
+    pos = float((gmsc_y == 1).sum())
+    neg = float((gmsc_y == 0).sum())
+    pos_weight = neg / max(pos, 1.0)
+    return torch.tensor([pos_weight])
+
 
 def train_adv_only(X_train: np.ndarray, y_risk_train: np.ndarray, y_savings_train: np.ndarray,
                    X_val: np.ndarray, y_risk_val: np.ndarray, y_savings_val: np.ndarray,
-                   config: Dict, seed: int) -> Dict:
+                   config: Dict, seed: int) -> Tuple[Dict, nn.Module]:
     """
     Train ADV-only baseline (no GMSC transfer).
-    Uses same architecture but without GMSC adapter/data.
+    Uses DataLoader with reshuffling each epoch.
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
+    random.seed(seed)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Bug #4 FIX: Normalize y arrays to shape (N,)
+    y_risk_train = np.asarray(y_risk_train).reshape(-1)
+    y_savings_train = np.asarray(y_savings_train).reshape(-1)
+    y_risk_val = np.asarray(y_risk_val).reshape(-1)
+    y_savings_val = np.asarray(y_savings_val).reshape(-1)
 
     # Create model (GMSC adapter won't be used)
     model = DomainTransferModel(
@@ -676,40 +876,40 @@ def train_adv_only(X_train: np.ndarray, y_risk_train: np.ndarray, y_savings_trai
         config=config
     )
 
-    # Create data loaders
+    # Create datasets and DataLoaders (FIX 3)
     train_dataset = ADVDataset(X_train, y_risk_train, y_savings_train)
     val_dataset = ADVDataset(X_val, y_risk_val, y_savings_val)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.get('batch_size', 64),
-        shuffle=True
+        shuffle=True,
+        drop_last=False
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config.get('batch_size', 64)
+        batch_size=config.get('batch_size', 64),
+        shuffle=False
     )
 
-    # Disable domain alignment for ADV-only
+    # Disable GMSC-related stuff for ADV-only
     trainer_config = config.copy()
     trainer_config['alignment_enabled'] = False
+    trainer_config['gmsc_risk_weight'] = 0.0
+    trainer_config['warmup_epochs'] = 0
+    trainer_config['freeze_trunk_epochs'] = 0
 
     # Create trainer
     trainer = DomainTransferTrainer(model, trainer_config, device)
 
-    # Prepare training batches (ADV only)
-    train_batches = []
-    for batch in train_loader:
-        train_batches.append((batch, None))
-
-    # Train
-    metrics = trainer.fit(
-        train_batches,
+    # Train with DataLoaders
+    metrics = trainer.fit_with_dataloaders(
+        train_loader,
         val_loader,
+        gmsc_train_loader=None,
         max_epochs=config.get('max_epochs', 100)
     )
 
-    # Return metrics and trained model for downstream saving
     return metrics, trainer.model
 
 
@@ -717,16 +917,35 @@ def train_with_gmsc_transfer(
     adv_X_train: np.ndarray, adv_y_risk_train: np.ndarray, adv_y_savings_train: np.ndarray,
     adv_X_val: np.ndarray, adv_y_risk_val: np.ndarray, adv_y_savings_val: np.ndarray,
     gmsc_X_train: np.ndarray, gmsc_y_train: np.ndarray,
-    config: Dict, seed: int
-) -> Dict:
+    config: Dict, seed: int,
+    ablation_mode: str = 'full'
+) -> Tuple[Dict, nn.Module]:
     """
     Train with GMSC auxiliary supervision.
-    Mixed-domain batches with loss masking.
+    Uses proper DataLoaders with reshuffling.
+
+    Args:
+        ablation_mode:
+            'full' (A3): Transfer + alignment (default)
+            'no_alignment' (A1): Transfer without alignment
+            'alignment_only' (A2): Alignment without GMSC loss (toxic test)
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
+    random.seed(seed)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Bug #4 FIX: Normalize y arrays to shape (N,)
+    adv_y_risk_train = np.asarray(adv_y_risk_train).reshape(-1)
+    adv_y_savings_train = np.asarray(adv_y_savings_train).reshape(-1)
+    adv_y_risk_val = np.asarray(adv_y_risk_val).reshape(-1)
+    adv_y_savings_val = np.asarray(adv_y_savings_val).reshape(-1)
+    gmsc_y_train = np.asarray(gmsc_y_train).reshape(-1)
+
+    # Compute GMSC pos_weight for class imbalance (FIX 2.1)
+    gmsc_pos_weight = compute_gmsc_pos_weight(gmsc_y_train)
+    print(f"  GMSC class imbalance: pos_weight = {gmsc_pos_weight.item():.2f}")
 
     # Create model
     model = DomainTransferModel(
@@ -740,65 +959,950 @@ def train_with_gmsc_transfer(
     adv_val_dataset = ADVDataset(adv_X_val, adv_y_risk_val, adv_y_savings_val)
     gmsc_train_dataset = GMSCDataset(gmsc_X_train, gmsc_y_train)
 
-    # Create validation loader (ADV only)
-    val_loader = DataLoader(
+    # Create DataLoaders (FIX 3)
+    batch_size = config.get('batch_size', 64)
+
+    adv_train_loader = DataLoader(
+        adv_train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=False
+    )
+    adv_val_loader = DataLoader(
         adv_val_dataset,
-        batch_size=config.get('batch_size', 64)
+        batch_size=batch_size,
+        shuffle=False
+    )
+    gmsc_train_loader = DataLoader(
+        gmsc_train_dataset,
+        batch_size=max(1, batch_size // 3),  # Smaller GMSC batch
+        shuffle=True,
+        drop_last=False
     )
 
-    # Create mixed-domain training batches
-    batch_size = config.get('batch_size', 64)
-    adv_ratio = config.get('adv_ratio', 0.7)
-    adv_per_batch = int(batch_size * adv_ratio)
-    gmsc_per_batch = batch_size - adv_per_batch
-
-    # Generate training batches
-    rng = np.random.RandomState(seed)
-    n_batches = len(adv_train_dataset) // adv_per_batch
-
-    adv_indices = rng.permutation(len(adv_train_dataset))
-    gmsc_indices = rng.permutation(len(gmsc_train_dataset))
-
-    train_batches = []
-    for batch_idx in range(n_batches):
-        # ADV batch
-        adv_start = batch_idx * adv_per_batch
-        adv_batch_indices = adv_indices[adv_start:adv_start + adv_per_batch]
-
-        adv_batch = {
-            'features': torch.stack([adv_train_dataset[i]['features'] for i in adv_batch_indices]),
-            'risk_target': torch.stack([adv_train_dataset[i]['risk_target'] for i in adv_batch_indices]),
-            'savings_target': torch.stack([adv_train_dataset[i]['savings_target'] for i in adv_batch_indices])
-        }
-
-        # GMSC batch (cycle if needed)
-        gmsc_start = (batch_idx * gmsc_per_batch) % len(gmsc_train_dataset)
-        gmsc_batch_indices = []
-        for i in range(gmsc_per_batch):
-            idx = (gmsc_start + i) % len(gmsc_train_dataset)
-            gmsc_batch_indices.append(gmsc_indices[idx])
-
-        gmsc_batch = {
-            'features': torch.stack([gmsc_train_dataset[i]['features'] for i in gmsc_batch_indices]),
-            'risk_target': torch.stack([gmsc_train_dataset[i]['risk_target'] for i in gmsc_batch_indices])
-        }
-
-        train_batches.append((adv_batch, gmsc_batch))
-
-    # Enable domain alignment
+    # Configure based on ablation mode (FIX 1)
     trainer_config = config.copy()
-    trainer_config['alignment_enabled'] = config.get('alignment_enabled', True)
-    trainer_config['alignment_method'] = config.get('alignment_method', 'coral')
-    trainer_config['alignment_weight'] = config.get('alignment_weight', 0.1)
 
-    # Create trainer
-    trainer = DomainTransferTrainer(model, trainer_config, device)
+    if ablation_mode == 'no_alignment':
+        # A1: Transfer without alignment
+        trainer_config['alignment_enabled'] = False
+        trainer_config['gmsc_risk_weight'] = config.get('gmsc_risk_weight', 0.05)
+        print("  Ablation A1: Transfer WITHOUT alignment")
 
-    # Train
-    metrics = trainer.fit(
-        train_batches,
-        val_loader,
+    elif ablation_mode == 'alignment_only':
+        # A2: Alignment without GMSC loss (toxic test)
+        trainer_config['alignment_enabled'] = True
+        trainer_config['gmsc_risk_weight'] = 0.0  # No GMSC loss!
+        print("  Ablation A2: Alignment ONLY (no GMSC loss) - toxic test")
+
+    else:  # 'full'
+        # A3: Full transfer + alignment
+        trainer_config['alignment_enabled'] = config.get('alignment_enabled', False)
+        trainer_config['gmsc_risk_weight'] = config.get('gmsc_risk_weight', 0.05)
+        print(f"  Ablation A3: Full transfer (alignment={trainer_config['alignment_enabled']})")
+
+    # Create trainer with pos_weight
+    trainer = DomainTransferTrainer(
+        model, trainer_config, device,
+        gmsc_pos_weight=gmsc_pos_weight
+    )
+
+    # Train with DataLoaders
+    metrics = trainer.fit_with_dataloaders(
+        adv_train_loader,
+        adv_val_loader,
+        gmsc_train_loader=gmsc_train_loader,
         max_epochs=config.get('max_epochs', 100)
     )
 
+    # Return training logs as well
+    metrics['_epoch_logs'] = trainer.epoch_logs
+
     return metrics, trainer.model
+
+
+# =============================================================================
+# UPGRADE #2: RISK BINNING (Convert regression to ordinal classification)
+# =============================================================================
+
+def create_risk_bins(y_risk: np.ndarray, n_bins: int = 4, method: str = 'quantile') -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Convert continuous Risk_Score to discrete bins for ordinal classification.
+
+    This aligns ADV risk with GMSC delinquency (both become classification).
+
+    Args:
+        y_risk: Continuous risk scores
+        n_bins: Number of bins (3-5 recommended)
+        method: 'quantile' (equal frequency) or 'uniform' (equal width)
+
+    Returns:
+        y_binned: Integer bin labels (0 to n_bins-1)
+        bin_edges: Bin edge values for inference
+    """
+    if method == 'quantile':
+        # Equal frequency bins
+        bin_edges = np.percentile(y_risk, np.linspace(0, 100, n_bins + 1))
+        # Ensure unique edges
+        bin_edges = np.unique(bin_edges)
+        n_bins = len(bin_edges) - 1
+    else:
+        # Equal width bins
+        bin_edges = np.linspace(y_risk.min(), y_risk.max(), n_bins + 1)
+
+    y_binned = np.digitize(y_risk, bin_edges[1:-1])  # Returns 0 to n_bins-1
+
+    return y_binned.astype(np.int64), bin_edges
+
+
+class ADVDatasetBinned(Dataset):
+    """ADV dataset with binned risk for ordinal classification."""
+
+    def __init__(self, X: np.ndarray, y_risk_binned: np.ndarray, y_risk_continuous: np.ndarray,
+                 y_savings: np.ndarray, n_bins: int):
+        self.X = torch.FloatTensor(X)
+        self.y_risk_binned = torch.LongTensor(y_risk_binned)
+        self.y_risk_continuous = torch.FloatTensor(y_risk_continuous)  # Keep for evaluation
+        self.y_savings = torch.FloatTensor(y_savings)
+        self.n_bins = n_bins
+        self.domain = 0
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return {
+            'features': self.X[idx],
+            'risk_target': self.y_risk_binned[idx],
+            'risk_continuous': self.y_risk_continuous[idx],
+            'savings_target': self.y_savings[idx],
+            'domain': self.domain,
+            'has_savings': True,
+            'is_binned': True
+        }
+
+
+class DomainTransferModelBinned(nn.Module):
+    """
+    Domain Transfer Model with binned ADV risk (ordinal classification).
+
+    This aligns label space: both ADV and GMSC become classification tasks.
+    """
+
+    def __init__(self, adv_input_dim: int, gmsc_input_dim: int, config: Dict, n_risk_bins: int = 4):
+        super().__init__()
+
+        dropout = config.get('dropout', 0.3)
+        latent_dim = config.get('latent_dim', 32)
+        self.n_risk_bins = n_risk_bins
+
+        # Domain adapters
+        self.adv_adapter = DomainAdapter(
+            input_dim=adv_input_dim,
+            hidden_dims=config.get('adv_adapter_dims', [64]),
+            output_dim=latent_dim,
+            dropout=dropout
+        )
+
+        self.gmsc_adapter = DomainAdapter(
+            input_dim=gmsc_input_dim,
+            hidden_dims=config.get('gmsc_adapter_dims', [32]),
+            output_dim=latent_dim,
+            dropout=dropout
+        )
+
+        # Shared trunk
+        self.shared_trunk = SharedTrunk(
+            input_dim=latent_dim,
+            hidden_dims=config.get('shared_trunk_dims', [64, 32]),
+            dropout=dropout
+        )
+
+        trunk_output_dim = self.shared_trunk.output_dim
+
+        # Risk head for ADV (ordinal classification with n_bins classes)
+        self.adv_risk_head = TaskHead(
+            input_dim=trunk_output_dim,
+            hidden_dims=config.get('risk_head_dims', [16]),
+            output_dim=n_risk_bins,  # Multi-class
+            dropout=dropout,
+            final_activation=None
+        )
+
+        # Risk head for GMSC (binary classification)
+        self.gmsc_risk_head = TaskHead(
+            input_dim=trunk_output_dim,
+            hidden_dims=config.get('risk_head_dims', [16]),
+            output_dim=1,
+            dropout=dropout,
+            final_activation=None
+        )
+
+        # Savings head (ADV only)
+        self.savings_head = TaskHead(
+            input_dim=trunk_output_dim,
+            hidden_dims=config.get('savings_head_dims', [16]),
+            output_dim=1,
+            dropout=dropout,
+            final_activation=None
+        )
+
+    def forward_adv(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass for ADV domain."""
+        adapted = self.adv_adapter(x)
+        shared = self.shared_trunk(adapted)
+        risk_logits = self.adv_risk_head(shared)  # (batch, n_bins)
+        savings_out = self.savings_head(shared)
+        return risk_logits, savings_out, shared
+
+    def forward_gmsc(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass for GMSC domain."""
+        adapted = self.gmsc_adapter(x)
+        shared = self.shared_trunk(adapted)
+        risk_out = self.gmsc_risk_head(shared)
+        return risk_out, shared
+
+    def forward(self, x: torch.Tensor, domain: int) -> Dict[str, torch.Tensor]:
+        if domain == 0:
+            risk, savings, shared = self.forward_adv(x)
+            return {'risk': risk, 'savings': savings, 'shared': shared}
+        else:
+            risk, shared = self.forward_gmsc(x)
+            return {'risk': risk, 'shared': shared}
+
+
+# =============================================================================
+# UPGRADE #1: PRETRAIN -> FINE-TUNE TRAINING STRATEGY (FIXED)
+# =============================================================================
+
+class PretrainFineTuneTrainer:
+    """
+    Two-phase training: Pretrain on GMSC, then Fine-tune on ADV.
+
+    FIXES APPLIED:
+    - Optimizer is RESET between phases (no state leakage)
+    - Early stopping state is RESET between phases
+    - Config values are logged at startup for validation
+    - freeze_trunk_epochs applies only in Phase 2, once
+    - warmup_epochs / adv_ratio / gmsc_ratio are IGNORED (not relevant here)
+
+    Phase 1 (Pretrain): Train gmsc_adapter + trunk + gmsc_head on GMSC only
+    Phase 2 (Fine-tune): Train adv_adapter + adv_risk_head + savings_head on ADV
+                         Trunk uses small LR (or frozen initially)
+    Phase 3 (Optional Joint): Brief joint training with very small gmsc_weight
+    """
+
+    def __init__(self, model: DomainTransferModel, config: Dict, device: str = 'cpu',
+                 gmsc_pos_weight: Optional[torch.Tensor] = None):
+        self.model = model.to(device)
+        self.device = device
+        self.config = config
+
+        # ============================================================
+        # EXPLICIT CONFIG READING WITH VALIDATION LOGGING
+        # ============================================================
+
+        # Phase epochs
+        self.pretrain_epochs = config.get('pretrain_epochs', 15)
+        self.finetune_epochs = config.get('finetune_epochs', 40)
+        self.joint_epochs = config.get('joint_epochs', 0)  # Default OFF
+        self.enable_joint_phase = config.get('enable_joint_phase', False)
+
+        # Learning rates
+        self.lr = config.get('lr', 0.0005)
+        self.finetune_trunk_lr = config.get('finetune_trunk_lr', 0.00005)
+
+        # Loss weights
+        self.joint_gmsc_weight = config.get('joint_gmsc_weight', 0.0)
+        self.gmsc_risk_weight = config.get('gmsc_risk_weight', 0.01)
+
+        # Regularization
+        self.weight_decay = config.get('weight_decay', 0.001)
+        self.dropout = config.get('dropout', 0.15)
+        self.clip_grad = config.get('clip_grad', 1.0)
+
+        # Training
+        self.batch_size = config.get('batch_size', 16)
+        self.patience = config.get('patience', 10)
+
+        # Phase 2 specific
+        self.freeze_trunk_epochs = config.get('freeze_trunk_epochs', 3)
+
+        # ============================================================
+        # LOG ALL CONFIG VALUES FOR VALIDATION
+        # ============================================================
+        print("\n" + "=" * 60)
+        print("PRETRAIN-FINETUNE CONFIG (ACTUAL VALUES USED)")
+        print("=" * 60)
+        print(f"  Phase 1 (Pretrain):")
+        print(f"    pretrain_epochs:     {self.pretrain_epochs}")
+        print(f"    lr:                  {self.lr}")
+        print(f"  Phase 2 (Fine-tune):")
+        print(f"    finetune_epochs:     {self.finetune_epochs}")
+        print(f"    finetune_trunk_lr:   {self.finetune_trunk_lr}")
+        print(f"    freeze_trunk_epochs: {self.freeze_trunk_epochs}")
+        print(f"  Phase 3 (Joint):")
+        print(f"    enable_joint_phase:  {self.enable_joint_phase}")
+        print(f"    joint_epochs:        {self.joint_epochs}")
+        print(f"    joint_gmsc_weight:   {self.joint_gmsc_weight}")
+        print(f"  General:")
+        print(f"    batch_size:          {self.batch_size}")
+        print(f"    weight_decay:        {self.weight_decay}")
+        print(f"    patience:            {self.patience}")
+        print("=" * 60)
+
+        # Loss functions
+        if gmsc_pos_weight is not None:
+            self.gmsc_pos_weight = gmsc_pos_weight
+            self.gmsc_loss_fn = nn.BCEWithLogitsLoss(pos_weight=gmsc_pos_weight.to(device))
+        else:
+            self.gmsc_pos_weight = None
+            self.gmsc_loss_fn = nn.BCEWithLogitsLoss()
+
+        self.adv_risk_loss_fn = nn.HuberLoss() if config.get('risk_loss', 'huber') == 'huber' else nn.MSELoss()
+        self.savings_loss_fn = nn.BCEWithLogitsLoss()
+
+        self.training_log = []
+
+    def pretrain_on_gmsc(self, gmsc_loader: DataLoader) -> Dict:
+        """
+        Phase 1: Pretrain on GMSC data only.
+        Trains: gmsc_adapter, shared_trunk, gmsc_risk_head
+
+        Creates NEW optimizer (no state from previous runs).
+        """
+        print(f"\n=== PHASE 1: PRETRAIN ON GMSC ({self.pretrain_epochs} epochs) ===")
+
+        # Only train GMSC-related parameters
+        params_to_train = list(self.model.gmsc_adapter.parameters()) + \
+                         list(self.model.shared_trunk.parameters()) + \
+                         list(self.model.gmsc_risk_head.parameters())
+
+        # NEW OPTIMIZER for Phase 1
+        optimizer = optim.Adam(params_to_train, lr=self.lr, weight_decay=self.weight_decay)
+
+        best_loss = float('inf')
+        patience_counter = 0
+        best_state = None
+
+        for epoch in range(self.pretrain_epochs):
+            self.model.train()
+            epoch_losses = []
+
+            for batch in gmsc_loader:
+                optimizer.zero_grad()
+
+                features = batch['features'].to(self.device)
+                target = batch['risk_target'].to(self.device)
+
+                output = self.model.forward(features, domain=1)
+                loss = self.gmsc_loss_fn(output['risk'], target)
+
+                loss.backward()
+                if self.clip_grad:
+                    torch.nn.utils.clip_grad_norm_(params_to_train, self.clip_grad)
+                optimizer.step()
+
+                epoch_losses.append(loss.item())
+
+            avg_loss = np.mean(epoch_losses)
+            self.training_log.append({'phase': 'pretrain', 'epoch': epoch + 1, 'loss': avg_loss})
+
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    print(f"  Pretrain early stopping at epoch {epoch + 1}")
+                    break
+
+        # Restore best state from Phase 1
+        if best_state:
+            self.model.load_state_dict(best_state)
+
+        print(f"  Pretrain complete. Best loss: {best_loss:.4f}")
+        return {'pretrain_loss': best_loss, 'pretrain_epochs': epoch + 1}
+
+    def finetune_on_adv(self, adv_train_loader: DataLoader, adv_val_loader: DataLoader) -> Dict:
+        """
+        Phase 2: Fine-tune on ADV data.
+        Trains: adv_adapter, adv_risk_head, savings_head, trunk (with small LR)
+
+        Creates NEW optimizer (no state leakage from Phase 1).
+        Early stopping state is RESET.
+        Trunk freeze applies ONCE at the beginning, then unfreeze.
+        """
+        print(f"\n=== PHASE 2: FINE-TUNE ON ADV ({self.finetune_epochs} epochs) ===")
+
+        # ============================================================
+        # NEW OPTIMIZER with proper param groups
+        # ============================================================
+        param_groups = [
+            {'params': self.model.adv_adapter.parameters(), 'lr': self.lr, 'name': 'adv_adapter'},
+            {'params': self.model.adv_risk_head.parameters(), 'lr': self.lr, 'name': 'adv_risk_head'},
+            {'params': self.model.savings_head.parameters(), 'lr': self.lr, 'name': 'savings_head'},
+            {'params': self.model.shared_trunk.parameters(), 'lr': self.finetune_trunk_lr, 'name': 'trunk'}
+        ]
+
+        optimizer = optim.Adam(param_groups, weight_decay=self.weight_decay)
+
+        print(f"  Optimizer param groups:")
+        print(f"    adv_adapter/heads: lr={self.lr}")
+        print(f"    trunk:             lr={self.finetune_trunk_lr}")
+
+        # ============================================================
+        # Trunk freeze logic - applies ONCE at beginning
+        # ============================================================
+        trunk_frozen = False
+        trunk_unfrozen = False  # Track if we've already unfrozen
+
+        if self.freeze_trunk_epochs > 0:
+            set_requires_grad(self.model.shared_trunk, False)
+            trunk_frozen = True
+            print(f"  Trunk FROZEN for first {self.freeze_trunk_epochs} epochs")
+
+        # ============================================================
+        # RESET early stopping state
+        # ============================================================
+        best_val_loss = float('inf')
+        best_metrics = None
+        best_state = None
+        patience_counter = 0
+
+        for epoch in range(self.finetune_epochs):
+            # Unfreeze trunk after initial epochs (ONCE)
+            if trunk_frozen and not trunk_unfrozen and epoch >= self.freeze_trunk_epochs:
+                set_requires_grad(self.model.shared_trunk, True)
+                trunk_frozen = False
+                trunk_unfrozen = True
+                print(f"  Epoch {epoch + 1}: Trunk UNFROZEN")
+
+            self.model.train()
+            epoch_losses = []
+
+            for batch in adv_train_loader:
+                optimizer.zero_grad()
+
+                features = batch['features'].to(self.device)
+                risk_target = batch['risk_target'].to(self.device)
+                savings_target = batch['savings_target'].to(self.device)
+
+                output = self.model.forward(features, domain=0)
+
+                risk_loss = self.adv_risk_loss_fn(output['risk'], risk_target)
+                savings_loss = self.savings_loss_fn(output['savings'], savings_target)
+                loss = risk_loss + savings_loss
+
+                loss.backward()
+                if self.clip_grad:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
+                optimizer.step()
+
+                epoch_losses.append(loss.item())
+
+            # Validation
+            val_metrics = self._evaluate_adv(adv_val_loader)
+            val_loss = val_metrics['risk_mae']
+
+            self.training_log.append({
+                'phase': 'finetune', 'epoch': epoch + 1,
+                'train_loss': np.mean(epoch_losses), 'val_mae': val_loss
+            })
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_metrics = val_metrics
+                best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    print(f"  Fine-tune early stopping at epoch {epoch + 1}")
+                    break
+
+        # Restore best model
+        if best_state:
+            self.model.load_state_dict(best_state)
+
+        print(f"  Fine-tune complete. Best MAE: {best_val_loss:.4f}")
+        return best_metrics
+
+    def joint_training(self, adv_train_loader: DataLoader, adv_val_loader: DataLoader,
+                       gmsc_train_loader: DataLoader) -> Optional[Dict]:
+        """
+        Phase 3 (Optional): Brief joint training with very small GMSC weight.
+
+        ONLY runs if enable_joint_phase=True AND joint_epochs > 0.
+        Creates NEW optimizer.
+        """
+        if not self.enable_joint_phase or self.joint_epochs <= 0:
+            print("\n=== PHASE 3: JOINT TRAINING SKIPPED ===")
+            return None
+
+        print(f"\n=== PHASE 3: JOINT TRAINING ({self.joint_epochs} epochs) ===")
+        print(f"  joint_gmsc_weight: {self.joint_gmsc_weight}")
+
+        if self.joint_gmsc_weight <= 0:
+            print("  WARNING: joint_gmsc_weight=0, joint phase has no effect!")
+
+        # NEW OPTIMIZER for Phase 3
+        optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=self.lr * 0.5,  # Reduced LR
+            weight_decay=self.weight_decay
+        )
+
+        best_val_loss = float('inf')
+        best_metrics = None
+        best_state = None
+
+        for epoch in range(self.joint_epochs):
+            self.model.train()
+            epoch_losses = []
+            gmsc_iter = iter(gmsc_train_loader)
+
+            for adv_batch in adv_train_loader:
+                optimizer.zero_grad()
+
+                # ADV forward
+                adv_features = adv_batch['features'].to(self.device)
+                adv_risk_target = adv_batch['risk_target'].to(self.device)
+                adv_savings_target = adv_batch['savings_target'].to(self.device)
+
+                adv_output = self.model.forward(adv_features, domain=0)
+                adv_loss = self.adv_risk_loss_fn(adv_output['risk'], adv_risk_target) + \
+                          self.savings_loss_fn(adv_output['savings'], adv_savings_target)
+
+                # GMSC forward (small weight as regularizer)
+                gmsc_loss_val = 0.0
+                if self.joint_gmsc_weight > 0:
+                    try:
+                        gmsc_batch = next(gmsc_iter)
+                    except StopIteration:
+                        gmsc_iter = iter(gmsc_train_loader)
+                        gmsc_batch = next(gmsc_iter)
+
+                    gmsc_features = gmsc_batch['features'].to(self.device)
+                    gmsc_target = gmsc_batch['risk_target'].to(self.device)
+
+                    gmsc_output = self.model.forward(gmsc_features, domain=1)
+                    gmsc_loss = self.gmsc_loss_fn(gmsc_output['risk'], gmsc_target)
+                    gmsc_loss_val = gmsc_loss.item()
+
+                    # Combined loss
+                    loss = adv_loss + self.joint_gmsc_weight * gmsc_loss
+                else:
+                    loss = adv_loss
+
+                loss.backward()
+                if self.clip_grad:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
+                optimizer.step()
+
+                epoch_losses.append(loss.item())
+
+            # Validation
+            val_metrics = self._evaluate_adv(adv_val_loader)
+            val_loss = val_metrics['risk_mae']
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_metrics = val_metrics
+                best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+
+        if best_state:
+            self.model.load_state_dict(best_state)
+
+        print(f"  Joint training complete. Best MAE: {best_val_loss:.4f}")
+        return best_metrics
+
+    def _evaluate_adv(self, adv_loader: DataLoader) -> Dict:
+        """
+        Evaluate model on ADV validation data.
+
+        Bug #2 FIX: Returns ALL metrics to match baseline:
+        - risk_mae, risk_rmse, risk_r2, risk_spearman
+        - savings_macro_f1, savings_accuracy, savings_precision, savings_recall
+        """
+        self.model.eval()
+
+        all_risk_preds, all_risk_true = [], []
+        all_savings_preds, all_savings_true = [], []
+
+        with torch.no_grad():
+            for batch in adv_loader:
+                features = batch['features'].to(self.device)
+                risk_target = batch['risk_target']
+                savings_target = batch['savings_target']
+
+                output = self.model.forward(features, domain=0)
+
+                # Bug #2 FIX: Ensure proper numpy conversion
+                all_risk_preds.extend(output['risk'].cpu().numpy().flatten())
+                all_risk_true.extend(risk_target.cpu().numpy().flatten())
+
+                savings_probs = torch.sigmoid(output['savings'])
+                all_savings_preds.extend((savings_probs > 0.5).cpu().numpy().flatten().astype(int))
+                all_savings_true.extend(savings_target.cpu().numpy().flatten().astype(int))
+
+        # Convert to numpy arrays
+        y_true = np.array(all_risk_true)
+        y_pred = np.array(all_risk_preds)
+
+        # Bug #2 FIX: Calculate R2 score
+        ss_res = np.sum((y_true - y_pred) ** 2)
+        ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+        risk_r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+        # Bug #2 FIX: Return ALL metrics matching baseline
+        metrics = {
+            'risk_mae': mean_absolute_error(y_true, y_pred),
+            'risk_rmse': np.sqrt(mean_squared_error(y_true, y_pred)),
+            'risk_r2': risk_r2,
+            'savings_macro_f1': f1_score(all_savings_true, all_savings_preds, average='macro', zero_division=0),
+            'savings_accuracy': accuracy_score(all_savings_true, all_savings_preds),
+            'savings_precision': precision_score(all_savings_true, all_savings_preds, average='macro', zero_division=0),
+            'savings_recall': recall_score(all_savings_true, all_savings_preds, average='macro', zero_division=0)
+        }
+
+        # Spearman with constant array protection
+        if np.std(y_true) > 1e-8 and np.std(y_pred) > 1e-8:
+            try:
+                metrics['risk_spearman'] = spearmanr(y_true, y_pred)[0]
+            except Exception:
+                metrics['risk_spearman'] = 0.0
+        else:
+            metrics['risk_spearman'] = 0.0
+
+        return metrics
+
+    def fit(self, adv_train_loader: DataLoader, adv_val_loader: DataLoader,
+            gmsc_train_loader: DataLoader) -> Dict:
+        """
+        Full pretrain -> fine-tune pipeline.
+        """
+        # Phase 1: Pretrain on GMSC
+        pretrain_result = self.pretrain_on_gmsc(gmsc_train_loader)
+
+        # Phase 2: Fine-tune on ADV
+        finetune_metrics = self.finetune_on_adv(adv_train_loader, adv_val_loader)
+
+        # Phase 3: Optional joint training
+        if self.enable_joint_phase and self.joint_epochs > 0:
+            joint_metrics = self.joint_training(
+                adv_train_loader, adv_val_loader, gmsc_train_loader
+            )
+            if joint_metrics and joint_metrics['risk_mae'] < finetune_metrics['risk_mae']:
+                print("  Joint training IMPROVED results!")
+                return joint_metrics
+            elif joint_metrics:
+                print("  Joint training did NOT improve (keeping finetune result)")
+
+        return finetune_metrics
+
+
+def train_pretrain_finetune(
+    adv_X_train: np.ndarray, adv_y_risk_train: np.ndarray, adv_y_savings_train: np.ndarray,
+    adv_X_val: np.ndarray, adv_y_risk_val: np.ndarray, adv_y_savings_val: np.ndarray,
+    gmsc_X_train: np.ndarray, gmsc_y_train: np.ndarray,
+    config: Dict, seed: int
+) -> Tuple[Dict, nn.Module]:
+    """
+    UPGRADE #1: Train using Pretrain -> Fine-tune strategy.
+
+    FIXED:
+    - Config values are passed directly to trainer (no nested access)
+    - Batch size uses the safe value for small datasets
+    - All values are logged for validation
+    - Bug #4 FIX: y arrays are normalized to shape (N,) to avoid broadcasting issues
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Bug #4 FIX: Normalize y arrays to shape (N,) to avoid loss broadcasting issues
+    adv_y_risk_train = np.asarray(adv_y_risk_train).reshape(-1)
+    adv_y_savings_train = np.asarray(adv_y_savings_train).reshape(-1)
+    adv_y_risk_val = np.asarray(adv_y_risk_val).reshape(-1)
+    adv_y_savings_val = np.asarray(adv_y_savings_val).reshape(-1)
+    gmsc_y_train = np.asarray(gmsc_y_train).reshape(-1)
+
+    # Compute pos_weight for GMSC
+    gmsc_pos_weight = compute_gmsc_pos_weight(gmsc_y_train)
+    print(f"GMSC pos_weight: {gmsc_pos_weight.item():.2f}")
+
+    # Create model with config
+    model = DomainTransferModel(
+        adv_input_dim=adv_X_train.shape[1],
+        gmsc_input_dim=gmsc_X_train.shape[1],
+        config=config
+    )
+
+    # Create datasets
+    adv_train_ds = ADVDataset(adv_X_train, adv_y_risk_train, adv_y_savings_train)
+    adv_val_ds = ADVDataset(adv_X_val, adv_y_risk_val, adv_y_savings_val)
+
+    # SUBSAMPLE GMSC for pretrain - 150k samples is too much!
+    # Use max 5000 samples (or gmsc_pretrain_samples from config)
+    gmsc_pretrain_samples = config.get('gmsc_pretrain_samples', 5000)
+    if len(gmsc_X_train) > gmsc_pretrain_samples:
+        rng = np.random.RandomState(seed)
+        indices = rng.choice(len(gmsc_X_train), size=gmsc_pretrain_samples, replace=False)
+        gmsc_X_subset = gmsc_X_train[indices]
+        gmsc_y_subset = gmsc_y_train[indices]
+        print(f"  GMSC subsampled: {len(gmsc_X_train)} -> {gmsc_pretrain_samples}")
+    else:
+        gmsc_X_subset = gmsc_X_train
+        gmsc_y_subset = gmsc_y_train
+
+    gmsc_train_ds = GMSCDataset(gmsc_X_subset, gmsc_y_subset)
+
+    # Batch size from config - use larger batch for GMSC pretrain
+    batch_size = config.get('batch_size', 16)  # Safe default for ADV
+    gmsc_batch_size = config.get('gmsc_batch_size', 64)  # Larger for GMSC pretrain
+
+    print(f"  ADV train samples: {len(adv_train_ds)}")
+    print(f"  ADV val samples:   {len(adv_val_ds)}")
+    print(f"  GMSC samples:      {len(gmsc_train_ds)} (subsampled from {len(gmsc_X_train)})")
+    print(f"  ADV batch size:    {batch_size}")
+    print(f"  GMSC batch size:   {gmsc_batch_size}")
+    print(f"  ADV batches/epoch: {len(adv_train_ds) // batch_size}")
+    print(f"  GMSC batches/epoch: {len(gmsc_train_ds) // gmsc_batch_size}")
+
+    adv_train_loader = DataLoader(adv_train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+    adv_val_loader = DataLoader(adv_val_ds, batch_size=batch_size, shuffle=False)
+    gmsc_train_loader = DataLoader(gmsc_train_ds, batch_size=gmsc_batch_size, shuffle=True, drop_last=False)
+
+    # Create trainer - config is passed directly, trainer reads all values
+    trainer = PretrainFineTuneTrainer(model, config, device, gmsc_pos_weight)
+
+    # Train
+    metrics = trainer.fit(adv_train_loader, adv_val_loader, gmsc_train_loader)
+
+    return metrics, trainer.model
+
+
+# =============================================================================
+# UPGRADE #4: OPTIMIZED MIXTURE SAMPLING
+# =============================================================================
+
+class LightGMSCSampler:
+    """
+    Subsample GMSC data to prevent it from dominating gradients.
+
+    Instead of using all GMSC data every epoch, sample a subset.
+    """
+
+    def __init__(self, gmsc_dataset: GMSCDataset, sample_ratio: float = 0.1, seed: int = 42):
+        """
+        Args:
+            gmsc_dataset: Full GMSC dataset
+            sample_ratio: Fraction of GMSC to use each epoch (e.g., 0.1 = 10%)
+            seed: Random seed
+        """
+        self.full_dataset = gmsc_dataset
+        self.sample_ratio = sample_ratio
+        self.seed = seed
+        self.epoch = 0
+
+    def get_epoch_subset(self) -> DataLoader:
+        """Get a random subset of GMSC for this epoch."""
+        rng = np.random.RandomState(self.seed + self.epoch)
+        n_samples = max(1, int(len(self.full_dataset) * self.sample_ratio))
+        indices = rng.choice(len(self.full_dataset), size=n_samples, replace=False)
+
+        # Create subset
+        subset_X = self.full_dataset.X[indices]
+        subset_y = self.full_dataset.y_dlq[indices]
+
+        subset_ds = GMSCDataset(subset_X.numpy(), subset_y.numpy())
+        self.epoch += 1
+
+        return DataLoader(subset_ds, batch_size=32, shuffle=True)
+
+
+def train_with_optimized_mixture(
+    adv_X_train: np.ndarray, adv_y_risk_train: np.ndarray, adv_y_savings_train: np.ndarray,
+    adv_X_val: np.ndarray, adv_y_risk_val: np.ndarray, adv_y_savings_val: np.ndarray,
+    gmsc_X_train: np.ndarray, gmsc_y_train: np.ndarray,
+    config: Dict, seed: int
+) -> Tuple[Dict, nn.Module]:
+    """
+    UPGRADE #4: Training with optimized ADV-dominant mixture.
+
+    - ADV ratio: 0.85-0.95
+    - GMSC subsampled each epoch (10-20% of full dataset)
+    - This prevents GMSC from dominating gradients
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Bug #4 FIX: Normalize y arrays to shape (N,)
+    adv_y_risk_train = np.asarray(adv_y_risk_train).reshape(-1)
+    adv_y_savings_train = np.asarray(adv_y_savings_train).reshape(-1)
+    adv_y_risk_val = np.asarray(adv_y_risk_val).reshape(-1)
+    adv_y_savings_val = np.asarray(adv_y_savings_val).reshape(-1)
+    gmsc_y_train = np.asarray(gmsc_y_train).reshape(-1)
+
+    # Config with optimized ratios
+    config = config.copy()
+    config.setdefault('adv_ratio', 0.9)  # 90% ADV
+    gmsc_sample_ratio = config.get('gmsc_sample_ratio', 0.1)  # Use only 10% of GMSC per epoch
+
+    print(f"\nOptimized mixture: ADV ratio={config['adv_ratio']}, GMSC sample ratio={gmsc_sample_ratio}")
+
+    gmsc_pos_weight = compute_gmsc_pos_weight(gmsc_y_train)
+
+    model = DomainTransferModel(
+        adv_input_dim=adv_X_train.shape[1],
+        gmsc_input_dim=gmsc_X_train.shape[1],
+        config=config
+    )
+
+    # Datasets
+    adv_train_ds = ADVDataset(adv_X_train, adv_y_risk_train, adv_y_savings_train)
+    adv_val_ds = ADVDataset(adv_X_val, adv_y_risk_val, adv_y_savings_val)
+    gmsc_full_ds = GMSCDataset(gmsc_X_train, gmsc_y_train)
+
+    batch_size = config.get('batch_size', 64)
+    adv_train_loader = DataLoader(adv_train_ds, batch_size=batch_size, shuffle=True)
+    adv_val_loader = DataLoader(adv_val_ds, batch_size=batch_size, shuffle=False)
+
+    # Light GMSC sampler
+    gmsc_sampler = LightGMSCSampler(gmsc_full_ds, sample_ratio=gmsc_sample_ratio, seed=seed)
+
+    # Trainer
+    trainer = DomainTransferTrainer(model, config, device, gmsc_pos_weight)
+
+    # Custom training loop with subsampled GMSC
+    best_val_loss = float('inf')
+    best_metrics = None
+    best_state = None
+    patience_counter = 0
+
+    max_epochs = config.get('max_epochs', 100)
+    warmup_epochs = config.get('warmup_epochs', 10)
+
+    for epoch in range(max_epochs):
+        in_warmup = epoch < warmup_epochs
+
+        if not in_warmup:
+            # Get fresh GMSC subset for this epoch
+            gmsc_epoch_loader = gmsc_sampler.get_epoch_subset()
+            gmsc_iter = iter(gmsc_epoch_loader)
+
+        model.train()
+        epoch_losses = []
+
+        for adv_batch in adv_train_loader:
+            gmsc_batch = None
+            if not in_warmup:
+                try:
+                    gmsc_batch = next(gmsc_iter)
+                except StopIteration:
+                    gmsc_epoch_loader = gmsc_sampler.get_epoch_subset()
+                    gmsc_iter = iter(gmsc_epoch_loader)
+                    gmsc_batch = next(gmsc_iter)
+
+            loss_components = trainer.train_step(adv_batch, gmsc_batch, epoch=epoch, use_gmsc=not in_warmup)
+            epoch_losses.append(loss_components['total'])
+
+        # Validation
+        val_metrics = trainer.evaluate_adv(adv_val_loader)
+        val_loss = val_metrics['risk_mae']
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_metrics = val_metrics
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= config.get('patience', 15):
+                print(f"Early stopping at epoch {epoch + 1}")
+                break
+
+    if best_state:
+        model.load_state_dict(best_state)
+
+    return best_metrics, model
+
+
+# =============================================================================
+# COMBINED UPGRADE FUNCTION (All improvements)
+# =============================================================================
+
+def train_with_all_upgrades(
+    adv_X_train: np.ndarray, adv_y_risk_train: np.ndarray, adv_y_savings_train: np.ndarray,
+    adv_X_val: np.ndarray, adv_y_risk_val: np.ndarray, adv_y_savings_val: np.ndarray,
+    gmsc_X_train: np.ndarray, gmsc_y_train: np.ndarray,
+    config: Dict, seed: int,
+    use_pretrain_finetune: bool = True,
+    use_risk_binning: bool = False,
+    use_optimized_mixture: bool = True,
+    use_safe_alignment: bool = False
+) -> Tuple[Dict, nn.Module]:
+    """
+    Train with all upgrades enabled.
+
+    Recommended combination:
+    - use_pretrain_finetune=True (Upgrade #1)
+    - use_risk_binning=False (Upgrade #2 - optional, changes the task)
+    - use_optimized_mixture=True (Upgrade #4)
+    - use_safe_alignment=False (Upgrade #3 - only if transfer already works)
+    """
+    print("\n" + "=" * 70)
+    print("DOMAIN TRANSFER WITH ALL UPGRADES")
+    print("=" * 70)
+    print(f"  Pretrain->Finetune: {use_pretrain_finetune}")
+    print(f"  Risk binning: {use_risk_binning}")
+    print(f"  Optimized mixture: {use_optimized_mixture}")
+    print(f"  Safe alignment: {use_safe_alignment}")
+    print("=" * 70)
+
+    # Apply config upgrades
+    config = config.copy()
+
+    if use_optimized_mixture:
+        config['adv_ratio'] = config.get('adv_ratio', 0.9)
+        config['gmsc_sample_ratio'] = config.get('gmsc_sample_ratio', 0.1)
+        config['gmsc_risk_weight'] = config.get('gmsc_risk_weight', 0.02)
+
+    if use_safe_alignment:
+        config['alignment_enabled'] = True
+        config['alignment_weight'] = 0.01  # Very small
+        config['alignment_start_epoch'] = 30  # Late start
+    else:
+        config['alignment_enabled'] = False
+
+    # Route to appropriate training function
+    if use_pretrain_finetune:
+        return train_pretrain_finetune(
+            adv_X_train, adv_y_risk_train, adv_y_savings_train,
+            adv_X_val, adv_y_risk_val, adv_y_savings_val,
+            gmsc_X_train, gmsc_y_train,
+            config, seed
+        )
+    elif use_optimized_mixture:
+        return train_with_optimized_mixture(
+            adv_X_train, adv_y_risk_train, adv_y_savings_train,
+            adv_X_val, adv_y_risk_val, adv_y_savings_val,
+            gmsc_X_train, gmsc_y_train,
+            config, seed
+        )
+    else:
+        return train_with_gmsc_transfer(
+            adv_X_train, adv_y_risk_train, adv_y_savings_train,
+            adv_X_val, adv_y_risk_val, adv_y_savings_val,
+            gmsc_X_train, gmsc_y_train,
+            config, seed, ablation_mode='no_alignment'
+        )
+
+

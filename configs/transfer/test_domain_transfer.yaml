@@ -1,11 +1,16 @@
+# Test config for domain transfer - SAFE BASELINE
 experiment:
   name: "domain_transfer_test"
   seed: 42
   output_dir: "runs"
 
+training_strategy: "pretrain_finetune"
+
 data:
   adv_dataset_path: "data/processed/1_encoded.csv"
   gmsc_dataset_path: "data/gmsc/GiveMeSomeCredit-training.csv"
+  # NOTE: adv_ratio ignored for pretrain_finetune
+  adv_ratio: 0.90
 
 cross_validation:
   enabled: true
@@ -17,4 +22,28 @@ domain_alignment:
   enabled: false
 
 model:
-  type: "small_mlp"
+  # === SAFE BASELINE FOR SMALL DATASET ===
+  lr: 0.0005
+  finetune_trunk_lr: 0.00005
+  batch_size: 16
+  gmsc_batch_size: 128       # Larger batch for GMSC pretrain (fast)
+  gmsc_pretrain_samples: 5000  # Subsample GMSC (150k is too much!)
+  dropout: 0.15
+  weight_decay: 0.001
+  patience: 8
+  max_epochs: 30
+
+  # Loss weights
+  gmsc_risk_weight: 0.01
+  adv_risk_weight: 1.0
+  savings_weight: 1.0
+
+  # Pretrain-finetune settings
+  pretrain_epochs: 10
+  finetune_epochs: 20
+  freeze_trunk_epochs: 3
+
+  # Joint phase OFF
+  enable_joint_phase: false
+  joint_epochs: 0
+  joint_gmsc_weight: 0.0

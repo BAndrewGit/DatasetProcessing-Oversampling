@@ -508,24 +508,87 @@ sampling:
 ```
 runs/latent_oversampling/
 ├── fold_1/
-│   ├── pca_selection.json        # PCA K selection details
-│   ├── cluster_report.json       # Clustering results
-│   ├── synthetic_audit.json      # Quality gate results
-│   ├── metrics.json              # Fold-level metrics
-│   ├── model.joblib              # Trained MLP
-│   ├── scaler.joblib             # StandardScaler
-│   ├── pca.joblib                # Fitted PCA
-│   ├── kmeans.joblib             # Fitted KMeans
-│   ├── pca_evr.png               # EVR plot
-│   ├── latent_cluster_scatter.png # Cluster visualization
-│   └── anchor_predictions_vs_synth_count.png
+│   ├── pca/                          # PCA analysis plots
+│   │   ├── evr_per_component.png     # EVR per component + cumulative + thresholds
+│   │   ├── evr_vs_k.png              # EVR vs K for all candidates
+│   │   ├── reconstruction_error_vs_k.png
+│   │   ├── reconstruction_error_distribution.png
+│   │   └── pca_loadings_heatmap.png  # Top feature loadings
+│   ├── clustering/                   # Clustering analysis plots
+│   │   ├── latent_scatter.png        # 2D latent space with clusters
+│   │   ├── cluster_sizes.png         # Cluster size distribution
+│   │   ├── silhouette_vs_k.png       # Silhouette score vs K
+│   │   ├── davies_bouldin_vs_k.png   # DBI vs K
+│   │   ├── stability_ari_vs_k.png    # Bootstrap stability (ARI)
+│   │   └── distance_to_centroid.png  # Per-cluster distance distributions
+│   ├── synthetic_audit/              # Synthetic data quality plots
+│   │   ├── memorization_knn_histogram.png    # kNN distance check
+│   │   ├── two_sample_roc.png        # Real vs synthetic ROC
+│   │   ├── utility_comparison.png    # Baseline vs augmented boxplot
+│   │   ├── performance_vs_synth_count.png    # Performance line plot
+│   │   ├── anchor_stability.png      # Anchor predictions vs synth
+│   │   └── latent_real_vs_synth.png  # Real vs synthetic in latent space
+│   ├── pca_selection.json            # PCA K selection details
+│   ├── cluster_report.json           # Clustering results
+│   ├── synthetic_audit.json          # Quality gate results
+│   ├── metrics.json                  # Fold-level metrics
+│   ├── model.joblib                  # Trained MLP
+│   ├── scaler.joblib                 # StandardScaler
+│   ├── pca.joblib                    # Fitted PCA
+│   ├── kmeans.joblib                 # Fitted KMeans
+│   └── plots_summary.json            # List of all generated plots
 ├── ...
-├── oversampled_dataset.csv       # Full augmented dataset (with is_synthetic flag)
-├── augmented_data.csv            # Clean augmented dataset (ready to use)
-├── data_profile.json             # Augmentation statistics
-├── metrics.json                  # Aggregated metrics
-└── model.joblib                  # Representative model
+├── aggregate_plots/                  # Cross-fold summary plots
+│   ├── performance_boxplot_all_folds.png   # Performance distribution
+│   ├── performance_aggregate_line.png      # Mean±std across folds
+│   └── acceptance_rate.png           # Quality gate acceptance rates
+├── all_folds_performance.csv         # Combined performance data
+├── experiment_report.json            # Full experiment summary
+├── oversampled_dataset.csv           # Full augmented dataset (with is_synthetic flag)
+├── augmented_data.csv                # Clean augmented dataset (ready to use)
+├── data_profile.json                 # Augmentation statistics
+├── metrics.json                      # Aggregated metrics
+└── model.joblib                      # Representative model
 ```
+
+### Committee-Ready Plots (MUST-HAVE)
+
+The following plots are **mandatory** for a complete latent space analysis:
+
+#### 1. PCA Selection / Explained Variance
+
+| Plot | File | Purpose |
+|------|------|---------|
+| EVR per component | `pca/evr_per_component.png` | Bar chart + cumulative line with 80%/90%/95% thresholds, K marker |
+| EVR vs K | `pca/evr_vs_k.png` | Compare whiten=True/False, mark chosen K |
+| Reconstruction error vs K | `pca/reconstruction_error_vs_k.png` | Validate K selection with recon error |
+| PCA loadings heatmap | `pca/pca_loadings_heatmap.png` | Top feature contributions per PC |
+
+#### 2. Latent Space Visualization
+
+| Plot | File | Purpose |
+|------|------|---------|
+| Latent scatter | `clustering/latent_scatter.png` | 2D projection with cluster colors + centroids |
+| Cluster sizes | `clustering/cluster_sizes.png` | Size distribution with 5% threshold flag |
+
+#### 3. Cluster Selection Evidence
+
+| Plot | File | Purpose |
+|------|------|---------|
+| Silhouette vs K | `clustering/silhouette_vs_k.png` | Quality score for K=2..5, thresholds marked |
+| Davies-Bouldin vs K | `clustering/davies_bouldin_vs_k.png` | Lower is better, shows chosen K |
+| Stability (ARI) | `clustering/stability_ari_vs_k.png` | Bootstrap stability, 0.6/0.8 thresholds |
+| Distance to centroid | `clustering/distance_to_centroid.png` | Per-cluster histograms |
+
+#### 4. Synthetic Data Audit
+
+| Plot | File | Purpose |
+|------|------|---------|
+| Memorization check | `synthetic_audit/memorization_knn_histogram.png` | kNN distances, threshold marker |
+| Two-sample ROC | `synthetic_audit/two_sample_roc.png` | AUC < 0.75 required (can't distinguish) |
+| Utility comparison | `synthetic_audit/utility_comparison.png` | Boxplot: baseline vs augmented |
+| Performance vs synth | `synthetic_audit/performance_vs_synth_count.png` | Line plot with accepted/rejected markers |
+| Anchor stability | `synthetic_audit/anchor_stability.png` | Prediction consistency across synth counts |
 
 ### Synthetic data statistics
 

@@ -20,10 +20,76 @@ from sklearn.preprocessing import StandardScaler
 
 from experiments.io import load_config
 from experiments.config_schema import FORBIDDEN_TARGETS
+from experiments.data import RISK_SCORE_COMPONENTS  # Bug #5 FIX: Import leakage columns
 from experiments.domain_transfer import (
     train_adv_only,
-    train_with_gmsc_transfer
+    train_with_gmsc_transfer,
+    train_pretrain_finetune,
+    train_with_optimized_mixture,
+    train_with_all_upgrades
 )
+
+
+def flatten_cfg(cfg: dict) -> dict:
+    """
+    Flatten config from YAML structure into a single dict for training functions.
+
+    Bug #1 FIX: This ensures all YAML values are properly read, not defaults.
+
+    Maps:
+    - cfg['model'][*] -> flat[*]
+    - cfg['domain_alignment'][*] -> flat['alignment_*']
+    - cfg['data'][*] -> flat[*] (for ratios etc.)
+    """
+    model = cfg.get("model", {})
+    align = cfg.get("domain_alignment", {})
+    data = cfg.get("data", {})
+
+    # Start with model config as base
+    flat = dict(model)
+
+    # Map domain_alignment.* -> alignment_*
+    flat["alignment_enabled"] = align.get("enabled", False)
+    flat["alignment_method"] = align.get("method", "coral")
+    flat["alignment_weight"] = align.get("weight", 0.01)
+    flat["alignment_start_epoch"] = align.get("start_epoch", 20)
+    flat["alignment_max_weight"] = align.get("max_weight", 0.05)
+
+    # Map data ratios
+    flat["adv_ratio"] = data.get("adv_ratio", flat.get("adv_ratio", 0.9))
+    flat["gmsc_ratio"] = data.get("gmsc_ratio", flat.get("gmsc_ratio", 0.1))
+
+    # Ensure all expected keys have defaults
+    defaults = {
+        'lr': 0.0005,
+        'finetune_trunk_lr': 0.00005,
+        'batch_size': 16,
+        'gmsc_batch_size': 128,
+        'gmsc_pretrain_samples': 5000,
+        'dropout': 0.15,
+        'weight_decay': 0.001,
+        'patience': 10,
+        'max_epochs': 100,
+        'gmsc_risk_weight': 0.01,
+        'adv_risk_weight': 1.0,
+        'savings_weight': 1.0,
+        'warmup_epochs': 0,
+        'freeze_trunk_epochs': 3,
+        'pretrain_epochs': 15,
+        'finetune_epochs': 40,
+        'enable_joint_phase': False,
+        'joint_epochs': 0,
+        'joint_gmsc_weight': 0.0,
+        'gmsc_sample_ratio': 0.10,
+        'clip_grad': 1.0,
+        'risk_loss': 'huber',
+    }
+
+    for key, default_val in defaults.items():
+        if key not in flat:
+            flat[key] = default_val
+
+    return flat
 
 
 def set_seeds(seed: int):
@@ -87,6 +153,13 @@ def load_adv_data(config: dict, dataset_path: str = None) -> tuple:
     if forbidden_in_features:
         print(f"[WARN] Found forbidden columns in ADV features: {forbidden_in_features}. They will be removed from features.")
         feature_cols = [c for c in feature_cols if c not in FORBIDDEN_TARGETS]
+
+    # Bug #5 FIX: Exclude RISK_SCORE_COMPONENTS to prevent leakage
+    # These columns are used to calculate Risk_Score, including them makes the task trivially easy
+    leakage_cols = [c for c in feature_cols if c in RISK_SCORE_COMPONENTS]
+    if leakage_cols:
+        print(f"[LEAKAGE PREVENTION] Excluding Risk_Score formula components: {leakage_cols}")
+        feature_cols = [c for c in feature_cols if c not in RISK_SCORE_COMPONENTS]
 
     # Final check - if no features left, raise
     if not feature_cols:
@@ -158,15 +231,24 @@ def run_domain_transfer_cv(
     Run repeated K-fold CV for domain transfer ablation.
 
     Compares:
-    1. ADV-only training
-    2. ADV + GMSC transfer (with domain alignment)
+    1. ADV-only training (baseline)
+    2. ADV + GMSC transfer (selected strategy from config)
+
+    Training strategies:
+    - 'joint': Original joint training
+    - 'pretrain_finetune': Pretrain on GMSC, then fine-tune on ADV (recommended)
+    - 'optimized_mixture': ADV-dominant with subsampled GMSC
 
     Evaluation on ADV data only.
     """
     n_splits = config['cross_validation'].get('n_splits', 5)
     n_repeats = config['cross_validation'].get('n_repeats', 5)
 
-    print(f"\nRunning {n_splits}-fold x {n_repeats} repeats CV...")
+    # Training strategy selection
+    training_strategy = config.get('training_strategy', 'joint')
+    print(f"\nTraining strategy: {training_strategy}")
+
+    print(f"Running {n_splits}-fold x {n_repeats} repeats CV...")
 
     cv = RepeatedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=seed)
 
@@ -174,15 +256,19 @@ def run_domain_transfer_cv(
     adv_only_metrics = []
     transfer_metrics = []
 
-    # Model config
-    model_config = config.get('model', {})
-    model_config['adv_ratio'] = config['data'].get('adv_ratio', 0.7)
+    # Bug #1 FIX: Use flatten_cfg to properly merge all config sections
+    model_config = flatten_cfg(config)
 
-    # Domain alignment config
-    alignment_config = config.get('domain_alignment', {})
-    model_config['alignment_enabled'] = alignment_config.get('enabled', True)
-    model_config['alignment_method'] = alignment_config.get('method', 'coral')
-    model_config['alignment_weight'] = alignment_config.get('weight', 0.1)
+    # Log the actual config being used
+    print("\n[CONFIG] Actual values being used:")
+    print(f"  lr: {model_config.get('lr')}")
+    print(f"  finetune_trunk_lr: {model_config.get('finetune_trunk_lr')}")
+    print(f"  batch_size: {model_config.get('batch_size')}")
+    print(f"  pretrain_epochs: {model_config.get('pretrain_epochs')}")
+    print(f"  finetune_epochs: {model_config.get('finetune_epochs')}")
+    print(f"  enable_joint_phase: {model_config.get('enable_joint_phase')}")
+    print(f"  alignment_enabled: {model_config.get('alignment_enabled')}")
+
 
     total_folds = n_splits * n_repeats
 
@@ -218,14 +304,30 @@ def run_domain_transfer_cv(
         saved_models['adv_scalers'].append(adv_scaler)
         saved_models['gmsc_scalers'].append(gmsc_scaler)
 
-        # Experiment 2: ADV + GMSC transfer
-        print("  Training ADV + GMSC transfer model...")
-        transfer_m, transfer_model = train_with_gmsc_transfer(
-            adv_X_train_s, adv_y_risk_train, adv_y_savings_train,
-            adv_X_val_s, adv_y_risk_val, adv_y_savings_val,
-            gmsc_X_s, gmsc_y,
-            model_config, fold_seed
-        )
+        # Experiment 2: ADV + GMSC transfer (using selected strategy)
+        print(f"  Training ADV + GMSC transfer model (strategy: {training_strategy})...")
+
+        if training_strategy == 'pretrain_finetune':
+            transfer_m, transfer_model = train_pretrain_finetune(
+                adv_X_train_s, adv_y_risk_train, adv_y_savings_train,
+                adv_X_val_s, adv_y_risk_val, adv_y_savings_val,
+                gmsc_X_s, gmsc_y,
+                model_config, fold_seed
+            )
+        elif training_strategy == 'optimized_mixture':
+            transfer_m, transfer_model = train_with_optimized_mixture(
+                adv_X_train_s, adv_y_risk_train, adv_y_savings_train,
+                adv_X_val_s, adv_y_risk_val, adv_y_savings_val,
+                gmsc_X_s, gmsc_y,
+                model_config, fold_seed
+            )
+        else:  # 'joint' (default)
+            transfer_m, transfer_model = train_with_gmsc_transfer(
+                adv_X_train_s, adv_y_risk_train, adv_y_savings_train,
+                adv_X_val_s, adv_y_risk_val, adv_y_savings_val,
+                gmsc_X_s, gmsc_y,
+                model_config, fold_seed
+            )
         transfer_metrics.append(transfer_m)
         saved_models['transfer_models'].append(transfer_model)
 
@@ -255,8 +357,12 @@ def _aggregate_metrics(metrics_list: list) -> dict:
     metric_names = metrics_list[0].keys()
 
     for metric_name in metric_names:
-        values = [m[metric_name] for m in metrics_list if m[metric_name] is not None]
-        if values:
+        # Skip non-numeric fields like _epoch_logs
+        if metric_name.startswith('_'):
+            continue
+        values = [m[metric_name] for m in metrics_list if metric_name in m and m[metric_name] is not None]
+        # Skip if values contain non-numeric types
+        if values and all(isinstance(v, (int, float)) for v in values):
             aggregated[metric_name] = {
                 'mean': float(np.mean(values)),
                 'std': float(np.std(values)),
@@ -274,7 +380,7 @@ def print_results(results: dict):
 
     # Risk metrics
     print("\n--- RISK REGRESSION (Risk_Score) - ADV Data Only ---")
-    print(f"{'Experiment':<25} {'MAE':<18} {'RMSE':<18} {'Spearman ρ':<18} {'R²':<18}")
+    print(f"{'Experiment':<25} {'MAE':<18} {'RMSE':<18} {'Spearman rho':<18} {'R2':<18}")
     print("-" * 90)
 
     for exp_name, label in [('adv_only', 'ADV-only (baseline)'), ('transfer', 'ADV + GMSC transfer')]:
@@ -409,9 +515,9 @@ def run_domain_transfer_experiment(config_path: str, adv_path: str = None, gmsc_
     print(f"Seed: {seed}")
     print("=" * 90)
     print("Architecture:")
-    print("  ADV features  -> ADV adapter  -┐")
-    print("                                 ├-> Shared trunk -> Risk head (ADV regression)")
-    print("  GMSC features -> GMSC adapter -┘              -> Risk head (GMSC classification)")
+    print("  ADV features  -> ADV adapter  -+")
+    print("                                 +-> Shared trunk -> Risk head (ADV regression)")
+    print("  GMSC features -> GMSC adapter -+              -> Risk head (GMSC classification)")
     print("                                                -> Savings head (ADV only)")
     print("=" * 90)
     print("Ablation design:")
@@ -445,11 +551,11 @@ def run_domain_transfer_experiment(config_path: str, adv_path: str = None, gmsc_
     print(f"Overall beneficial: {'Yes' if analysis['overall_beneficial'] else 'No'}")
 
     if analysis['overall_beneficial']:
-        print("\n✅ GMSC TRANSFER IS BENEFICIAL")
+        print("\n[OK] GMSC TRANSFER IS BENEFICIAL")
         print("   Recommendation: Include GMSC auxiliary supervision in final model")
         verdict = "beneficial"
     else:
-        print("\n❌ GMSC TRANSFER IS NOT BENEFICIAL")
+        print("\n[X] GMSC TRANSFER IS NOT BENEFICIAL")
         print("   Recommendation: Use ADV-only model")
         print("   This is valid science - transfer doesn't always help")
         verdict = "not_beneficial"

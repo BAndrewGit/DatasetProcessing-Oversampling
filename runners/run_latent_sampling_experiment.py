@@ -326,6 +326,151 @@ def main():
         print(f"Warning: failed to generate oversampled dataset: {e}")
         traceback.print_exc()
 
+    # --- Generate aggregate plots across all folds ---
+    try:
+        print("Generating aggregate plots across folds...")
+        from experiments.latent_plots import LatentExperimentPlotter
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        # Collect performance data from all folds
+        all_perf_data = []
+        fold_dirs = [d for d in os.listdir(out_root) if d.startswith('fold_') and os.path.isdir(os.path.join(out_root, d))]
+
+        for fold_dir in sorted(fold_dirs):
+            perf_path = os.path.join(out_root, fold_dir, 'performance_vs_synth_count.csv')
+            if os.path.exists(perf_path):
+                fold_perf = pd.read_csv(perf_path)
+                fold_perf['fold'] = fold_dir
+                all_perf_data.append(fold_perf)
+
+        if all_perf_data:
+            combined_perf = pd.concat(all_perf_data, ignore_index=True)
+
+            # Save combined performance data
+            combined_perf.to_csv(os.path.join(out_root, 'all_folds_performance.csv'), index=False)
+
+            # Create aggregate plots
+            agg_dir = os.path.join(out_root, 'aggregate_plots')
+            os.makedirs(agg_dir, exist_ok=True)
+
+            # Determine metric based on task
+            metric_col = 'mae' if task == 'regression' else 'macro_f1'
+
+            # 1. Boxplot: Performance across folds for each synth_count
+            plt.figure(figsize=(12, 6))
+            synth_counts = sorted(combined_perf['synth_count'].unique())
+            data_for_boxplot = []
+            labels = []
+            for sc in synth_counts:
+                subset = combined_perf[combined_perf['synth_count'] == sc][metric_col].dropna()
+                if len(subset) > 0:
+                    data_for_boxplot.append(subset.values)
+                    labels.append(f'n={sc}' if sc > 0 else 'Baseline')
+
+            if data_for_boxplot:
+                bp = plt.boxplot(data_for_boxplot, tick_labels=labels, patch_artist=True)
+                colors = ['lightgray'] + ['lightblue'] * (len(data_for_boxplot) - 1)
+                for patch, color in zip(bp['boxes'], colors):
+                    patch.set_facecolor(color)
+
+            ylabel = 'MAE (lower is better)' if task == 'regression' else 'Macro-F1 (higher is better)'
+            plt.xlabel('Synthetic Sample Count', fontsize=11)
+            plt.ylabel(ylabel, fontsize=11)
+            plt.title(f'Performance Across Folds ({n_splits} folds)', fontsize=12)
+            plt.grid(True, alpha=0.3, axis='y')
+            plt.tight_layout()
+            plt.savefig(os.path.join(agg_dir, 'performance_boxplot_all_folds.png'), dpi=150)
+            plt.close()
+
+            # 2. Line plot: Mean performance ± std across folds
+            plt.figure(figsize=(10, 5))
+            means = []
+            stds = []
+            valid_counts = []
+
+            for sc in synth_counts:
+                subset = combined_perf[combined_perf['synth_count'] == sc][metric_col].dropna()
+                if len(subset) > 0:
+                    means.append(subset.mean())
+                    stds.append(subset.std())
+                    valid_counts.append(sc)
+
+            if means:
+                plt.errorbar(valid_counts, means, yerr=stds, fmt='o-', capsize=5,
+                           markersize=8, linewidth=2, color='steelblue', ecolor='gray')
+
+                # Highlight baseline
+                if 0 in valid_counts:
+                    baseline_idx = valid_counts.index(0)
+                    plt.axhline(y=means[baseline_idx], color='red', linestyle='--',
+                              alpha=0.7, label='Baseline')
+
+            plt.xlabel('Synthetic Sample Count', fontsize=11)
+            plt.ylabel(f'{ylabel} (mean ± std)', fontsize=11)
+            plt.title(f'Aggregate Performance ({n_splits} folds)', fontsize=12)
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(os.path.join(agg_dir, 'performance_aggregate_line.png'), dpi=150)
+            plt.close()
+
+            # 3. Acceptance rate per synth_count
+            if 'accepted' in combined_perf.columns:
+                plt.figure(figsize=(8, 5))
+                acceptance_rates = []
+                for sc in synth_counts:
+                    if sc == 0:
+                        continue
+                    subset = combined_perf[combined_perf['synth_count'] == sc]['accepted']
+                    if len(subset) > 0:
+                        rate = subset.sum() / len(subset)
+                        acceptance_rates.append((sc, rate))
+
+                if acceptance_rates:
+                    scs, rates = zip(*acceptance_rates)
+                    colors = ['green' if r > 0.5 else 'red' for r in rates]
+                    plt.bar(range(len(scs)), rates, color=colors, alpha=0.7, edgecolor='black')
+                    plt.xticks(range(len(scs)), [f'n={s}' for s in scs])
+                    plt.xlabel('Synthetic Sample Count', fontsize=11)
+                    plt.ylabel('Acceptance Rate', fontsize=11)
+                    plt.title('Quality Gate Acceptance Rate per Synth Count', fontsize=12)
+                    plt.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
+                    plt.ylim(0, 1)
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(agg_dir, 'acceptance_rate.png'), dpi=150)
+                    plt.close()
+
+            print(f"  Saved aggregate plots to: {agg_dir}")
+
+        # Create a comprehensive summary report
+        summary_report = {
+            'experiment_id': os.path.basename(out_root),
+            'task': task,
+            'target': target,
+            'n_folds': n_splits,
+            'seed': seed,
+            'pca_candidates': normalized_cfg.get('pca_candidates', []),
+            'k_candidates': normalized_cfg.get('k_candidates', []),
+            'synth_grid': normalized_cfg.get('synth_grid', []),
+            'aggregated_metrics': dict(aggregated),
+            'plots_generated': {
+                'per_fold': ['pca/', 'clustering/', 'synthetic_audit/'],
+                'aggregate': ['performance_boxplot_all_folds.png', 'performance_aggregate_line.png', 'acceptance_rate.png']
+            }
+        }
+
+        with open(os.path.join(out_root, 'experiment_report.json'), 'w') as f:
+            json.dump(summary_report, f, indent=2)
+
+        print(f"  Saved experiment report to: {os.path.join(out_root, 'experiment_report.json')}")
+
+    except Exception as e:
+        import traceback
+        print(f"Warning: failed to generate aggregate plots: {e}")
+        traceback.print_exc()
+
     print(f"Latent sampling experiment complete. Results in: {out_root}")
 
 

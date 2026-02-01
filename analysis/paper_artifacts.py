@@ -767,6 +767,82 @@ def package_latent_sprint_artifacts(run_results: Dict[str, Any], run_dir: str, o
         }
         summary['ablation_row'] = ablation_row
 
+    # -------------------------------------------------------------------------
+    # NEW: Copy all latent plots from subfolders (pca/, clustering/, synthetic_audit/)
+    # -------------------------------------------------------------------------
+    import shutil
+
+    # Copy aggregate plots if available
+    if latent_summary and latent_summary.get('aggregate_plots'):
+        agg_out = os.path.join(out_dir, 'aggregate_plots')
+        os.makedirs(agg_out, exist_ok=True)
+        for plot_path in latent_summary['aggregate_plots']:
+            if os.path.exists(plot_path):
+                try:
+                    shutil.copy2(plot_path, agg_out)
+                except Exception:
+                    pass
+        summary['aggregate_plots_dir'] = agg_out
+
+    # Copy all_folds_performance.csv if available
+    if latent_summary and latent_summary.get('all_folds_performance'):
+        src = latent_summary['all_folds_performance']
+        if os.path.exists(src):
+            try:
+                shutil.copy2(src, os.path.join(out_dir, 'all_folds_performance.csv'))
+            except Exception:
+                pass
+
+    # Copy experiment_report.json if available
+    if latent_summary and latent_summary.get('experiment_report'):
+        src = latent_summary['experiment_report']
+        if os.path.exists(src):
+            try:
+                shutil.copy2(src, os.path.join(out_dir, 'experiment_report.json'))
+            except Exception:
+                pass
+
+    # Copy per-fold plots (from first fold as representative sample)
+    if latent_summary and latent_summary.get('folds'):
+        first_fold = latent_summary['folds'][0] if latent_summary['folds'] else None
+        if first_fold:
+            # Copy PCA plots
+            if first_fold.get('pca_plots'):
+                pca_out = os.path.join(out_dir, 'pca')
+                os.makedirs(pca_out, exist_ok=True)
+                for plot_path in first_fold['pca_plots']:
+                    if os.path.exists(plot_path):
+                        try:
+                            shutil.copy2(plot_path, pca_out)
+                        except Exception:
+                            pass
+                summary['pca_plots_dir'] = pca_out
+
+            # Copy clustering plots
+            if first_fold.get('clustering_plots'):
+                clust_out = os.path.join(out_dir, 'clustering')
+                os.makedirs(clust_out, exist_ok=True)
+                for plot_path in first_fold['clustering_plots']:
+                    if os.path.exists(plot_path):
+                        try:
+                            shutil.copy2(plot_path, clust_out)
+                        except Exception:
+                            pass
+                summary['clustering_plots_dir'] = clust_out
+
+            # Copy synthetic audit plots
+            if first_fold.get('synthetic_audit_plots'):
+                synth_out = os.path.join(out_dir, 'synthetic_audit')
+                os.makedirs(synth_out, exist_ok=True)
+                for plot_path in first_fold['synthetic_audit_plots']:
+                    if os.path.exists(plot_path):
+                        try:
+                            shutil.copy2(plot_path, synth_out)
+                        except Exception:
+                            pass
+                summary['synthetic_audit_plots_dir'] = synth_out
+    # -------------------------------------------------------------------------
+
     # Save summary json
     try:
         with open(os.path.join(out_dir, 'latent_sprint_summary.json'), 'w') as f:

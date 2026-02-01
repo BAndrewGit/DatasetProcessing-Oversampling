@@ -137,18 +137,41 @@ def load_experiment_results(run_dir: str) -> Dict:
             results['transfer'] = json.load(f)
 
     # Sprint 7 artifacts (latent sampling)
-    # Search run_dir and nested fold_* directories for pca_selection.json, performance_vs_synth_count.csv, latent_cluster_scatter.png
-    latent_summary = {'pca_selection': None, 'performance_csv': None, 'cluster_scatter': None, 'folds': []}
-    # check root first
+    # Search run_dir and nested fold_* directories for latent artifacts
+    # NEW structure: fold_*/pca/, fold_*/clustering/, fold_*/synthetic_audit/
+    latent_summary = {
+        'pca_selection': None,
+        'performance_csv': None,
+        'cluster_scatter': None,
+        'experiment_report': None,
+        'aggregate_plots': [],
+        'folds': []
+    }
+
+    # Check root-level artifacts
     root_pca = os.path.join(run_dir, 'pca_selection.json')
     root_perf = os.path.join(run_dir, 'performance_vs_synth_count.csv')
     root_scatter = os.path.join(run_dir, 'latent_cluster_scatter.png')
+    root_exp_report = os.path.join(run_dir, 'experiment_report.json')
+    all_folds_perf = os.path.join(run_dir, 'all_folds_performance.csv')
+
     if os.path.exists(root_pca):
         latent_summary['pca_selection'] = root_pca
     if os.path.exists(root_perf):
         latent_summary['performance_csv'] = root_perf
     if os.path.exists(root_scatter):
         latent_summary['cluster_scatter'] = root_scatter
+    if os.path.exists(root_exp_report):
+        latent_summary['experiment_report'] = root_exp_report
+    if os.path.exists(all_folds_perf):
+        latent_summary['all_folds_performance'] = all_folds_perf
+
+    # Check aggregate_plots directory
+    agg_plots_dir = os.path.join(run_dir, 'aggregate_plots')
+    if os.path.exists(agg_plots_dir):
+        for f in os.listdir(agg_plots_dir):
+            if f.endswith('.png'):
+                latent_summary['aggregate_plots'].append(os.path.join(agg_plots_dir, f))
 
     # Walk subdirectories (fold_*) and collect per-fold artifacts
     for root, dirs, files in os.walk(run_dir):
@@ -156,29 +179,60 @@ def load_experiment_results(run_dir: str) -> Dict:
         rel = os.path.relpath(root, run_dir)
         parts = rel.split(os.sep)
         if parts[0].startswith('fold') or 'fold_' in root.lower() or (len(parts) > 1 and parts[1].startswith('fold')):
+            # Old structure (direct files in fold_*)
             f_pca = os.path.join(root, 'pca_selection.json')
             f_perf = os.path.join(root, 'performance_vs_synth_count.csv')
             f_scatter = os.path.join(root, 'latent_cluster_scatter.png')
-            entry = {}
+
+            # New structure (subfolders)
+            f_pca_new = os.path.join(root, 'pca', 'evr_per_component.png')
+            f_clustering_new = os.path.join(root, 'clustering', 'latent_scatter.png')
+            f_synth_new = os.path.join(root, 'synthetic_audit', 'memorization_knn_histogram.png')
+
+            entry = {'fold_dir': root}
+
+            # Collect old structure files
             if os.path.exists(f_pca):
                 entry['pca_selection'] = f_pca
                 if latent_summary['pca_selection'] is None:
                     latent_summary['pca_selection'] = f_pca
             if os.path.exists(f_perf):
                 entry['performance_csv'] = f_perf
-                # if no root perf CSV set, set to first fold's perf CSV
                 if latent_summary['performance_csv'] is None:
                     latent_summary['performance_csv'] = f_perf
             if os.path.exists(f_scatter):
                 entry['cluster_scatter'] = f_scatter
                 if latent_summary['cluster_scatter'] is None:
                     latent_summary['cluster_scatter'] = f_scatter
-            if entry:
-                entry['fold_dir'] = root
+
+            # Collect new structure subfolders
+            pca_dir = os.path.join(root, 'pca')
+            clustering_dir = os.path.join(root, 'clustering')
+            synth_dir = os.path.join(root, 'synthetic_audit')
+
+            if os.path.exists(pca_dir):
+                entry['pca_plots'] = [os.path.join(pca_dir, f) for f in os.listdir(pca_dir) if f.endswith('.png')]
+            if os.path.exists(clustering_dir):
+                entry['clustering_plots'] = [os.path.join(clustering_dir, f) for f in os.listdir(clustering_dir) if f.endswith('.png')]
+                # Use new scatter if old not found
+                new_scatter = os.path.join(clustering_dir, 'latent_scatter.png')
+                if os.path.exists(new_scatter) and 'cluster_scatter' not in entry:
+                    entry['cluster_scatter'] = new_scatter
+                    if latent_summary['cluster_scatter'] is None:
+                        latent_summary['cluster_scatter'] = new_scatter
+            if os.path.exists(synth_dir):
+                entry['synthetic_audit_plots'] = [os.path.join(synth_dir, f) for f in os.listdir(synth_dir) if f.endswith('.png')]
+
+            # Check for plots_summary.json
+            plots_summary = os.path.join(root, 'plots_summary.json')
+            if os.path.exists(plots_summary):
+                entry['plots_summary'] = plots_summary
+
+            if len(entry) > 1:  # More than just fold_dir
                 latent_summary['folds'].append(entry)
 
     # If any latent artifacts were found, attach to results
-    if latent_summary['pca_selection'] or latent_summary['performance_csv'] or latent_summary['cluster_scatter'] or latent_summary['folds']:
+    if latent_summary['pca_selection'] or latent_summary['performance_csv'] or latent_summary['cluster_scatter'] or latent_summary['folds'] or latent_summary['aggregate_plots']:
         results['latent_sprint'] = latent_summary
 
     return results

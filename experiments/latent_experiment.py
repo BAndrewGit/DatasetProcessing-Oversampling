@@ -11,6 +11,7 @@ from scipy.stats import spearmanr
 from .latent_space import PCASelector
 from .clustering_latent import LatentClusterer
 from .latent_sampling import LatentSampler
+from .latent_plots import LatentExperimentPlotter
 from .save_model import save_sklearn_model, write_model_metadata
 import matplotlib
 matplotlib.use('Agg')
@@ -85,6 +86,69 @@ def run_latent_fold(X_train: pd.DataFrame, y_train: pd.Series, X_val: pd.DataFra
     # real gating logic must include two-sample, utility and stability checks
     # If gate fails, use real-only
     use_synth = gate_pass
+
+    # -------------------------------------------------------------------------
+    # COMPREHENSIVE PLOTTING (Sprint 3 / committee-ready)
+    # -------------------------------------------------------------------------
+    try:
+        plotter = LatentExperimentPlotter(out_dir, random_state=config.get('seed', 42))
+
+        # 1) PCA PLOTS
+        # EVR per component with cumulative and thresholds
+        plotter.plot_evr_per_component(pca_b, sel['chosen_k'], sel.get('chosen_whiten', True))
+
+        # EVR vs K for all candidates
+        pca_results = {(int(k.split('_')[0]), k.split('_')[1].lower() == 'true'): v
+                      for k, v in sel.get('candidates', {}).items()}
+        if pca_results:
+            plotter.plot_evr_vs_k(pca_results, sel['chosen_k'], sel.get('chosen_whiten', True))
+            plotter.plot_reconstruction_error_vs_k(pca_results, sel['chosen_k'])
+
+        # PCA loadings heatmap
+        feature_names = list(X_train.columns) if isinstance(X_train, pd.DataFrame) else [f'f{i}' for i in range(X_train.shape[1])]
+        plotter.plot_pca_loadings_heatmap(pca_b, feature_names, n_components=min(5, sel['chosen_k']), n_features=15)
+
+        # Reconstruction error distribution (train vs val)
+        plotter.plot_reconstruction_error_distribution(X_train.values, X_val.values, pca_b)
+
+        # 2) LATENT SPACE & CLUSTERING PLOTS
+        centroids = km.cluster_centers_ if km is not None else None
+        plotter.plot_latent_scatter(Z_train, labels_train, centroids,
+                                   title=f'Latent Clusters (K={k}, whiten={sel.get("chosen_whiten", True)})')
+        plotter.plot_cluster_size_distribution(labels_train, k)
+
+        # 3) CLUSTER SELECTION EVIDENCE
+        cluster_reports = best.get('reports', {})
+        if cluster_reports:
+            # Convert string keys to int if needed
+            cluster_reports_int = {int(kk): v for kk, v in cluster_reports.items()}
+            plotter.plot_silhouette_vs_k(cluster_reports_int, k)
+            plotter.plot_davies_bouldin_vs_k(cluster_reports_int, k)
+
+        # Cluster stability (ARI bootstrap)
+        k_candidates = config.get('k_candidates', [2, 3, 4, 5])
+        if isinstance(k_candidates, (list, tuple)) and len(k_candidates) > 1:
+            plotter.plot_cluster_stability_ari(Z_train, list(k_candidates), n_bootstrap=5)
+
+        # Distance to centroid distribution
+        if centroids is not None:
+            plotter.plot_distance_to_centroid_distribution(Z_train, labels_train, centroids)
+
+        # 4) SYNTHETIC AUDIT PLOTS
+        if X_synth is not None and X_synth.shape[0] > 0:
+            plotter.plot_memorization_histogram(X_train.values, X_synth, threshold=thresh)
+            plotter.plot_two_sample_roc(X_train.values, X_synth, auc_threshold=config.get('two_sample_auc_threshold', 0.75))
+            plotter.plot_latent_with_synthetic(Z_train, Z_synth, labels_train)
+
+        # Generate plots summary
+        plotter.generate_plots_summary()
+
+    except Exception as e:
+        # Plotting errors should not break the experiment
+        import traceback
+        print(f"Warning: plotting error in fold: {e}")
+        traceback.print_exc()
+    # -------------------------------------------------------------------------
 
     # 5) Train models
     if task == "regression":
@@ -276,7 +340,7 @@ def run_latent_fold(X_train: pd.DataFrame, y_train: pd.Series, X_val: pd.DataFra
                 'mae': baseline_metrics['mae'],
                 'rmse': baseline_metrics['rmse'],
                 'r2': baseline_metrics['r2'],
-                'spearman': float(spearmanr(y_val.values, y_pred_base).correlation) if len(y_val) > 1 else None,
+                'spearman': float(spearmanr(y_val.values, y_pred_base).correlation) if (len(y_val) > 1 and np.std(y_val.values) > 1e-8 and np.std(y_pred_base) > 1e-8) else 0.0,
                 'accepted': False
             })
         else:
@@ -320,7 +384,7 @@ def run_latent_fold(X_train: pd.DataFrame, y_train: pd.Series, X_val: pd.DataFra
                     mae = float(skmetrics.mean_absolute_error(y_val.values, y_pred))
                     rmse = float(np.sqrt(skmetrics.mean_squared_error(y_val.values, y_pred)))
                     r2 = float(skmetrics.r2_score(y_val.values, y_pred))
-                    spearman = float(spearmanr(y_val.values, y_pred).correlation) if len(y_val) > 1 else None
+                    spearman = float(spearmanr(y_val.values, y_pred).correlation) if (len(y_val) > 1 and np.std(y_val.values) > 1e-8 and np.std(y_pred) > 1e-8) else 0.0
                     row.update({'mae': mae, 'rmse': rmse, 'r2': r2, 'spearman': spearman})
                 else:
                     macro_f1 = float(skmetrics.f1_score(y_val.values, y_pred, average='macro', zero_division=0))
@@ -362,6 +426,37 @@ def run_latent_fold(X_train: pd.DataFrame, y_train: pd.Series, X_val: pd.DataFra
         old['performance_vs_synth'] = perf_rows
         with open(os.path.join(out_dir, 'metrics.json'), 'w') as mf:
             json.dump(old, mf, indent=2)
+
+        # -------------------------------------------------------------------------
+        # SYNTHETIC AUDIT PLOTS (utility + performance vs synth count)
+        # -------------------------------------------------------------------------
+        try:
+            # Re-use plotter instance if it exists, else create new one
+            if 'plotter' not in dir():
+                plotter = LatentExperimentPlotter(out_dir, random_state=config.get('seed', 42))
+
+            # Utility comparison (boxplot: baseline vs augmented)
+            plotter.plot_utility_comparison(perf_rows, task=task)
+
+            # Performance vs synthetic count (line plot)
+            plotter.plot_performance_vs_synth_count(perf_rows, task=task)
+
+            # Load and plot anchor results if available
+            anchor_path = os.path.join(out_dir, 'anchor_behavior.json')
+            if os.path.exists(anchor_path):
+                with open(anchor_path, 'r') as af:
+                    anchor_results = json.load(af)
+                plotter.plot_anchor_predictions_vs_synth(anchor_results)
+
+            # Update plots summary
+            plotter.generate_plots_summary()
+
+        except Exception as plot_err:
+            import traceback
+            print(f"Warning: utility plotting error: {plot_err}")
+            traceback.print_exc()
+        # -------------------------------------------------------------------------
+
     except Exception:
         # do not fail whole fold on ablation errors
         pass

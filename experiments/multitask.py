@@ -58,15 +58,26 @@ class MultiTaskModel(nn.Module):
 class MultiTaskTrainer:
     """
     Trainer for multi-task model with early stopping and gradient clipping.
+
+    CRITICAL FIX: Supports mode for proper single-task ablation.
+    - mode="multitask": optimizes both losses (default)
+    - mode="risk_only": optimizes only risk loss (savings head gets no gradient)
+    - mode="savings_only": optimizes only savings loss (risk head gets no gradient)
     """
 
     def __init__(self, model, device='cpu', lr=0.001, weight_decay=0.01,
-                 risk_loss_fn='huber', clip_grad=1.0, patience=10):
+                 risk_loss_fn='huber', clip_grad=1.0, patience=10,
+                 mode='multitask'):
         self.model = model.to(device)
         self.device = device
         self.optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
         self.clip_grad = clip_grad
         self.patience = patience
+
+        # Mode for ablation: "multitask", "risk_only", "savings_only"
+        assert mode in ['multitask', 'risk_only', 'savings_only'], \
+            f"Invalid mode: {mode}. Must be 'multitask', 'risk_only', or 'savings_only'"
+        self.mode = mode
 
         # Loss functions
         if risk_loss_fn == 'huber':
@@ -77,7 +88,7 @@ class MultiTaskTrainer:
         self.savings_loss_fn = nn.BCEWithLogitsLoss()
 
     def train_epoch(self, train_loader):
-        """Train one epoch."""
+        """Train one epoch with loss gating based on mode."""
         self.model.train()
         total_loss = 0.0
 
@@ -95,8 +106,13 @@ class MultiTaskTrainer:
             risk_loss = self.risk_loss_fn(risk_pred.squeeze(), y_risk_batch)
             savings_loss = self.savings_loss_fn(savings_logits.squeeze(), y_savings_batch)
 
-            # Combined loss (equal weighting)
-            loss = risk_loss + savings_loss
+            # LOSS GATING based on mode (FIX 2)
+            if self.mode == 'risk_only':
+                loss = risk_loss
+            elif self.mode == 'savings_only':
+                loss = savings_loss
+            else:  # multitask
+                loss = risk_loss + savings_loss
 
             # Backward pass
             loss.backward()
@@ -112,7 +128,7 @@ class MultiTaskTrainer:
         return total_loss / len(train_loader)
 
     def validate(self, val_loader):
-        """Validate and return loss + metrics."""
+        """Validate and return loss + metrics with loss gating."""
         self.model.eval()
         total_loss = 0.0
 
@@ -133,7 +149,14 @@ class MultiTaskTrainer:
                 # Compute losses
                 risk_loss = self.risk_loss_fn(risk_pred.squeeze(), y_risk_batch)
                 savings_loss = self.savings_loss_fn(savings_logits.squeeze(), y_savings_batch)
-                loss = risk_loss + savings_loss
+
+                # LOSS GATING based on mode (FIX 2)
+                if self.mode == 'risk_only':
+                    loss = risk_loss
+                elif self.mode == 'savings_only':
+                    loss = savings_loss
+                else:  # multitask
+                    loss = risk_loss + savings_loss
 
                 total_loss += loss.item()
 
@@ -163,7 +186,17 @@ class MultiTaskTrainer:
         # Risk metrics (regression)
         metrics['risk_mae'] = mean_absolute_error(y_risk_true, y_risk_pred)
         metrics['risk_rmse'] = np.sqrt(mean_squared_error(y_risk_true, y_risk_pred))
-        metrics['risk_spearman'] = spearmanr(y_risk_true, y_risk_pred)[0]
+
+        # Spearman correlation: handle constant arrays gracefully
+        # If predictions or true values are constant, correlation is undefined (set to 0)
+        if np.std(y_risk_true) > 1e-8 and np.std(y_risk_pred) > 1e-8:
+            try:
+                metrics['risk_spearman'] = spearmanr(y_risk_true, y_risk_pred)[0]
+            except Exception:
+                metrics['risk_spearman'] = 0.0
+        else:
+            # One or both arrays are constant - correlation is undefined
+            metrics['risk_spearman'] = 0.0
 
         ss_res = np.sum((y_risk_true - y_risk_pred) ** 2)
         ss_tot = np.sum((y_risk_true - np.mean(y_risk_true)) ** 2)
@@ -226,7 +259,11 @@ class MultiTaskTrainer:
 
 
 def train_single_task_risk(X_train, y_train, X_val, y_val, config, seed):
-    """Train risk-only model (ablation baseline)."""
+    """Train risk-only model (ablation baseline).
+
+    CRITICAL: Uses mode='risk_only' so only risk loss is optimized.
+    This ensures proper single-task ablation comparison.
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -241,7 +278,7 @@ def train_single_task_risk(X_train, y_train, X_val, y_val, config, seed):
     train_dataset = TensorDataset(
         torch.FloatTensor(X_train),
         torch.FloatTensor(y_train),
-        torch.zeros(len(y_train))  # Dummy savings labels
+        torch.zeros(len(y_train))  # Dummy savings labels (not used due to mode)
     )
     val_dataset = TensorDataset(
         torch.FloatTensor(X_val),
@@ -252,14 +289,15 @@ def train_single_task_risk(X_train, y_train, X_val, y_val, config, seed):
     train_loader = DataLoader(train_dataset, batch_size=config.get('batch_size', 32), shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config.get('batch_size', 32))
 
-    # Train
+    # Train with mode='risk_only' for proper ablation
     trainer = MultiTaskTrainer(
         model,
         lr=config.get('lr', 0.001),
         weight_decay=config.get('weight_decay', 0.01),
         risk_loss_fn=config.get('risk_loss', 'huber'),
         clip_grad=config.get('clip_grad', 1.0),
-        patience=config.get('patience', 10)
+        patience=config.get('patience', 10),
+        mode='risk_only'  # CRITICAL: Only optimize risk loss
     )
 
     metrics = trainer.fit(train_loader, val_loader, max_epochs=config.get('max_epochs', 100))
@@ -270,7 +308,11 @@ def train_single_task_risk(X_train, y_train, X_val, y_val, config, seed):
 
 
 def train_single_task_savings(X_train, y_train, X_val, y_val, config, seed):
-    """Train savings-only model (ablation baseline)."""
+    """Train savings-only model (ablation baseline).
+
+    CRITICAL: Uses mode='savings_only' so only savings loss is optimized.
+    This ensures proper single-task ablation comparison.
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -284,7 +326,7 @@ def train_single_task_savings(X_train, y_train, X_val, y_val, config, seed):
     # Prepare data loaders
     train_dataset = TensorDataset(
         torch.FloatTensor(X_train),
-        torch.zeros(len(y_train)),  # Dummy risk labels
+        torch.zeros(len(y_train)),  # Dummy risk labels (not used due to mode)
         torch.FloatTensor(y_train)
     )
     val_dataset = TensorDataset(
@@ -296,14 +338,15 @@ def train_single_task_savings(X_train, y_train, X_val, y_val, config, seed):
     train_loader = DataLoader(train_dataset, batch_size=config.get('batch_size', 32), shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config.get('batch_size', 32))
 
-    # Train
+    # Train with mode='savings_only' for proper ablation
     trainer = MultiTaskTrainer(
         model,
         lr=config.get('lr', 0.001),
         weight_decay=config.get('weight_decay', 0.01),
         risk_loss_fn=config.get('risk_loss', 'huber'),
         clip_grad=config.get('clip_grad', 1.0),
-        patience=config.get('patience', 10)
+        patience=config.get('patience', 10),
+        mode='savings_only'  # CRITICAL: Only optimize savings loss
     )
 
     metrics = trainer.fit(train_loader, val_loader, max_epochs=config.get('max_epochs', 100))
@@ -316,7 +359,10 @@ def train_single_task_savings(X_train, y_train, X_val, y_val, config, seed):
 def train_multitask(X_train, y_risk_train, y_savings_train,
                    X_val, y_risk_val, y_savings_val,
                    config, seed):
-    """Train multi-task model with both heads."""
+    """Train multi-task model with both heads.
+
+    Uses mode='multitask' to optimize both losses jointly.
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -342,14 +388,15 @@ def train_multitask(X_train, y_risk_train, y_savings_train,
     train_loader = DataLoader(train_dataset, batch_size=config.get('batch_size', 32), shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config.get('batch_size', 32))
 
-    # Train
+    # Train with mode='multitask' for joint optimization
     trainer = MultiTaskTrainer(
         model,
         lr=config.get('lr', 0.001),
         weight_decay=config.get('weight_decay', 0.01),
         risk_loss_fn=config.get('risk_loss', 'huber'),
         clip_grad=config.get('clip_grad', 1.0),
-        patience=config.get('patience', 10)
+        patience=config.get('patience', 10),
+        mode='multitask'  # Optimize both losses
     )
 
     metrics = trainer.fit(train_loader, val_loader, max_epochs=config.get('max_epochs', 100))

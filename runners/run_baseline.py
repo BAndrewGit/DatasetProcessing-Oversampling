@@ -107,7 +107,7 @@ def run_baseline(config_path, dataset_path=None, output_dir=None):
         print(f"MAE:      {cv_results['mae']['mean']:.4f} ± {cv_results['mae']['std']:.4f}")
         print(f"RMSE:     {cv_results['rmse']['mean']:.4f} ± {cv_results['rmse']['std']:.4f}")
         print(f"Spearman: {cv_results['spearman']['mean']:.4f} ± {cv_results['spearman']['std']:.4f}")
-        print(f"R²:       {cv_results['r2']['mean']:.4f} ± {cv_results['r2']['std']:.4f}")
+        print(f"R2:       {cv_results['r2']['mean']:.4f} ± {cv_results['r2']['std']:.4f}")
     else:
         cv_results = run_repeated_cv_classification(model, X, y, config)
         print("\n" + "=" * 60)

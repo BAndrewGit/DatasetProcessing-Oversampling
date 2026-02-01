@@ -13,9 +13,9 @@ import json
 
 from experiments.config_schema import validate_config, ConfigValidationError, FORBIDDEN_TARGETS
 from experiments.io import load_config, create_run_dir
-from experiments.data import load_dataset, validate_save_money_consistency
+from experiments.data import load_dataset, validate_save_money_consistency, RISK_SCORE_COMPONENTS
 from experiments.multitask import train_single_task_risk, train_single_task_savings, train_multitask
-from sklearn.model_selection import RepeatedKFold
+from sklearn.model_selection import RepeatedKFold, RepeatedStratifiedKFold
 
 
 def set_seeds(seed):
@@ -36,6 +36,10 @@ def set_seeds(seed):
 def preprocess_multitask_data(df, config):
     """
     Preprocess data for multi-task learning.
+
+    CRITICAL: Excludes RISK_SCORE_COMPONENTS to prevent leakage!
+    These columns are used to calculate Risk_Score, so including them
+    would make the task trivially easy and contaminate results.
 
     Returns:
         X: Feature matrix
@@ -60,14 +64,26 @@ def preprocess_multitask_data(df, config):
     if savings_target not in df.columns:
         raise ValueError(f"Savings target '{savings_target}' not found in dataset")
 
-    # Build feature set
-    exclude_cols = [risk_target, savings_target] + ignored + cols_to_drop
+    # =========================================================================
+    # FIX 1: EXCLUDE RISK_SCORE_COMPONENTS (LEAKAGE PREVENTION)
+    # =========================================================================
+    leakage_cols = [c for c in RISK_SCORE_COMPONENTS if c in df.columns]
+    if leakage_cols:
+        print(f"EXCLUDED (leakage prevention): {leakage_cols}")
+
+    # Build feature set - exclude targets, ignored, dropped, AND leakage cols
+    exclude_cols = [risk_target, savings_target] + ignored + cols_to_drop + leakage_cols
     feature_cols = [c for c in df.columns if c not in exclude_cols]
 
     # Verify no forbidden columns in features
     for col in feature_cols:
         if col in FORBIDDEN_TARGETS:
             raise ValueError(f"BLOCKED: Forbidden column '{col}' found in features!")
+
+    # DOUBLE-CHECK: Verify no leakage columns slipped through
+    bad_cols = [c for c in feature_cols if c in RISK_SCORE_COMPONENTS]
+    if bad_cols:
+        raise ValueError(f"LEAKAGE BUG: Risk_Score components in multitask features: {bad_cols}")
 
     X = df[feature_cols].copy()
     y_risk = df[risk_target].copy()
@@ -104,6 +120,9 @@ def run_multitask_cv(X, y_risk, y_savings, config):
     2. Savings-only
     3. Multi-task
 
+    FIX 3: Uses RepeatedStratifiedKFold to handle imbalanced classification.
+    Stratifies on y_savings (158/31 class imbalance).
+
     Returns:
         results: dict with aggregated metrics for each experiment
     """
@@ -112,9 +131,10 @@ def run_multitask_cv(X, y_risk, y_savings, config):
     n_repeats = config['cross_validation'].get('n_repeats', 3)
     total_folds = n_splits * n_repeats
 
-    print(f"\nRunning {n_splits}-fold x {n_repeats} repeats CV ({total_folds} folds total)...")
+    print(f"\nRunning {n_splits}-fold x {n_repeats} repeats STRATIFIED CV ({total_folds} folds total)...")
 
-    cv = RepeatedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=seed)
+    # FIX 3: Use RepeatedStratifiedKFold for proper class balance in each fold
+    cv = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=seed)
 
     risk_only_metrics = []
     savings_only_metrics = []
@@ -122,7 +142,8 @@ def run_multitask_cv(X, y_risk, y_savings, config):
     # Keep last model for each ablation to save
     saved_models = {'risk_only': None, 'savings_only': None, 'multitask': None}
 
-    for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X)):
+    # FIX 3: Split using y_savings for stratification
+    for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X, y_savings)):
         if (fold_idx + 1) % 5 == 0 or fold_idx == 0:
             print(f"  Fold {fold_idx + 1}/{total_folds}...")
 
@@ -196,7 +217,7 @@ def print_results(results):
 
     # Risk metrics
     print("\n--- RISK REGRESSION (Risk_Score) ---")
-    print(f"{'Experiment':<20} {'MAE':<15} {'RMSE':<15} {'Spearman ρ':<15} {'R²':<15}")
+    print(f"{'Experiment':<20} {'MAE':<15} {'RMSE':<15} {'Spearman rho':<15} {'R2':<15}")
     print("-" * 80)
 
     for exp_name in ['risk_only', 'multitask']:
