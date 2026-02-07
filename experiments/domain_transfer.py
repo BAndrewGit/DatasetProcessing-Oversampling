@@ -736,6 +736,7 @@ class DomainTransferTrainer:
 
             # Training
             epoch_losses = []
+            epoch_loss_details = []  # Collect detailed loss components per batch
             gmsc_iter = iter(gmsc_train_loader) if use_gmsc else None
 
             for adv_batch in adv_train_loader:
@@ -751,6 +752,7 @@ class DomainTransferTrainer:
 
                 loss_components = self.train_step(adv_batch, gmsc_batch, epoch=epoch, use_gmsc=use_gmsc)
                 epoch_losses.append(loss_components['total'])
+                epoch_loss_details.append(loss_components)
 
             avg_train_loss = np.mean(epoch_losses)
 
@@ -758,14 +760,28 @@ class DomainTransferTrainer:
             val_metrics = self.evaluate_adv(adv_val_loader)
             val_loss = val_metrics['risk_mae']  # Use MAE as validation criterion
 
-            # Log epoch
+            # Aggregate loss components for this epoch (for plotting)
+            agg_components = {}
+            if epoch_loss_details:
+                for key in ['adv_risk', 'savings', 'gmsc_risk', 'alignment', 'alignment_weight',
+                           'trunk_grad_norm', 'adv_adapter_grad_norm', 'gmsc_adapter_grad_norm',
+                           'adv_risk_head_grad_norm', 'savings_head_grad_norm']:
+                    values = [d.get(key) for d in epoch_loss_details if d.get(key) is not None]
+                    if values:
+                        agg_components[key] = float(np.mean(values))
+
+            # Log epoch with full details for plotting
             epoch_log = {
                 'epoch': epoch + 1,
+                'phase': 'joint',
                 'train_loss': avg_train_loss,
                 'val_mae': val_metrics['risk_mae'],
                 'val_f1': val_metrics['savings_macro_f1'],
+                'val_risk_rmse': val_metrics.get('risk_rmse'),
+                'val_risk_spearman': val_metrics.get('risk_spearman'),
                 'in_warmup': in_warmup,
-                'use_gmsc': use_gmsc
+                'use_gmsc': use_gmsc,
+                **agg_components  # Include aggregated loss components and grad norms
             }
             self.epoch_logs.append(epoch_log)
 
@@ -1682,6 +1698,9 @@ def train_pretrain_finetune(
 
     # Train
     metrics = trainer.fit(adv_train_loader, adv_val_loader, gmsc_train_loader)
+
+    # Add training logs for plotting
+    metrics['_epoch_logs'] = trainer.training_log
 
     return metrics, trainer.model
 

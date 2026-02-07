@@ -261,7 +261,7 @@ def test_train_adv_only_returns_metrics():
         'patience': 2
     }
 
-    metrics = train_adv_only(
+    metrics, model = train_adv_only(
         X_train, y_risk_train, y_savings_train,
         X_val, y_risk_val, y_savings_val,
         config, seed=42
@@ -274,6 +274,9 @@ def test_train_adv_only_returns_metrics():
     assert 'risk_r2' in metrics
     assert 'savings_macro_f1' in metrics
     assert 'savings_accuracy' in metrics
+
+    # Check model is returned
+    assert model is not None
 
 
 def test_train_with_gmsc_transfer_returns_metrics():
@@ -314,7 +317,7 @@ def test_train_with_gmsc_transfer_returns_metrics():
         'alignment_weight': 0.1
     }
 
-    metrics = train_with_gmsc_transfer(
+    metrics, model = train_with_gmsc_transfer(
         adv_X_train, adv_y_risk_train, adv_y_savings_train,
         adv_X_val, adv_y_risk_val, adv_y_savings_val,
         gmsc_X, gmsc_y,
@@ -326,6 +329,9 @@ def test_train_with_gmsc_transfer_returns_metrics():
     assert 'risk_rmse' in metrics
     assert 'savings_macro_f1' in metrics
     assert 'savings_accuracy' in metrics
+
+    # Check model is returned
+    assert model is not None
 
 
 # =============================================================================

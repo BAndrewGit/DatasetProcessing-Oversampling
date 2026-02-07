@@ -284,12 +284,19 @@ def run_full_pipeline(
                 if test_mode and os.path.exists("configs/transfer/test_domain_transfer.yaml"):
                     cfg = "configs/transfer/test_domain_transfer.yaml"
                 if os.path.exists(cfg):
+                    print(f"  Using config: {cfg}")
+                    print(f"  ADV dataset: {dataset_path}")
+                    print(f"  GMSC dataset: {gmsc}")
                     run_dir, verdict, _ = run_domain_transfer_experiment(cfg, dataset_path, gmsc, output_dir=PIPELINE_RUN_DIR)
                     results['domain_transfer'] = run_dir
                     run_dirs.append(run_dir)
                     print(f"[OK] {run_dir} - {verdict}")
+                else:
+                    print(f"[WARN] Config not found: {cfg}")
             except Exception as e:
-                print(f"[WARN] {e}")
+                import traceback
+                print(f"[WARN] Domain transfer error: {e}")
+                traceback.print_exc()
         else:
             print("[WARN] GMSC not found")
     else:

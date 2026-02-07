@@ -15,6 +15,7 @@ from experiments.config_schema import validate_config, ConfigValidationError, FO
 from experiments.io import load_config, create_run_dir
 from experiments.data import load_dataset, validate_save_money_consistency, RISK_SCORE_COMPONENTS
 from experiments.multitask import train_single_task_risk, train_single_task_savings, train_multitask
+from experiments.multitask_plots import generate_all_multitask_plots
 from sklearn.model_selection import RepeatedKFold, RepeatedStratifiedKFold
 
 
@@ -313,6 +314,30 @@ def run_multitask_experiment(config_path, dataset_path=None, output_dir=None):
 
     # Save results
     run_dir = create_run_dir(config)
+
+    # ==========================================================================
+    # GENERATE MULTITASK PLOTS
+    # ==========================================================================
+    print("\n" + "=" * 60)
+    print("GENERATING MULTITASK PLOTS")
+    print("=" * 60)
+
+    # Extract epoch logs if available (would need to be collected during training)
+    epoch_logs = results.get('epoch_logs', {})
+    grad_logs = results.get('grad_logs', [])
+
+    try:
+        plots = generate_all_multitask_plots(
+            results=results,
+            epoch_logs=epoch_logs if epoch_logs else None,
+            grad_logs=grad_logs if grad_logs else None,
+            output_dir=run_dir
+        )
+        print(f"Generated {len(plots)} multitask plots")
+    except Exception as e:
+        print(f"[WARN] Plot generation failed: {e}")
+        import traceback
+        traceback.print_exc()
 
     # Save config
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:

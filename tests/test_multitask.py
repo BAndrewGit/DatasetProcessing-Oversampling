@@ -145,7 +145,7 @@ def test_multitask_training_runs():
     }
 
     # Should complete without errors
-    metrics = train_multitask(
+    metrics, model = train_multitask(
         X_train, y_risk_train, y_savings_train,
         X_val, y_risk_val, y_savings_val,
         config, seed=42
@@ -158,4 +158,7 @@ def test_multitask_training_runs():
     assert 'risk_r2' in metrics
     assert 'savings_macro_f1' in metrics
     assert 'savings_accuracy' in metrics
+
+    # Check model is returned
+    assert model is not None
 

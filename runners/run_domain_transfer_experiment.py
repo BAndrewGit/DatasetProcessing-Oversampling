@@ -9,7 +9,6 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import json
-import argparse
 import random
 from datetime import datetime
 
@@ -26,8 +25,16 @@ from experiments.domain_transfer import (
     train_with_gmsc_transfer,
     train_pretrain_finetune,
     train_with_optimized_mixture,
-    train_with_all_upgrades
+    train_with_all_upgrades,
+    ADVDataset,
+    GMSCDataset,
 )
+from experiments.domain_transfer_plots import (
+    generate_all_domain_transfer_plots,
+    extract_latent_embeddings,
+    plot_ablation_comparison,
+)
+from torch.utils.data import DataLoader
 
 
 def flatten_cfg(cfg: dict) -> dict:
@@ -273,6 +280,17 @@ def run_domain_transfer_cv(
     total_folds = n_splits * n_repeats
 
     saved_models = {'adv_only_models': [], 'transfer_models': [], 'adv_scalers': [], 'gmsc_scalers': []}
+
+    # Collect data for plotting (from last fold)
+    last_fold_data = {
+        'training_logs': [],
+        'adv_X_val_s': None,
+        'adv_y_risk_val': None,
+        'gmsc_X_s': None,
+        'gmsc_y': None,
+        'transfer_model': None,
+    }
+
     for fold_idx, (train_idx, val_idx) in enumerate(cv.split(adv_X)):
         print(f"\nFold {fold_idx + 1}/{total_folds}")
 
@@ -331,6 +349,18 @@ def run_domain_transfer_cv(
         transfer_metrics.append(transfer_m)
         saved_models['transfer_models'].append(transfer_model)
 
+        # Collect training logs from last fold for plotting
+        if '_epoch_logs' in transfer_m:
+            last_fold_data['training_logs'] = transfer_m['_epoch_logs']
+
+        # Store data from last fold for embedding extraction
+        last_fold_data['adv_X_val_s'] = adv_X_val_s
+        last_fold_data['adv_y_risk_val'] = adv_y_risk_val
+        last_fold_data['adv_y_savings_val'] = adv_y_savings_val
+        last_fold_data['gmsc_X_s'] = gmsc_X_s
+        last_fold_data['gmsc_y'] = gmsc_y
+        last_fold_data['transfer_model'] = transfer_model
+
         # Progress report
         print(f"  ADV-only:  Risk MAE={adv_metrics['risk_mae']:.4f}, "
               f"Savings F1={adv_metrics['savings_macro_f1']:.4f}")
@@ -341,7 +371,9 @@ def run_domain_transfer_cv(
     results = {
         'adv_only': _aggregate_metrics(adv_only_metrics),
         'transfer': _aggregate_metrics(transfer_metrics),
-        'saved_models': saved_models
+        'saved_models': saved_models,
+        '_last_fold_data': last_fold_data,
+        '_model_config': model_config,
     }
 
     return results
@@ -567,7 +599,25 @@ def run_domain_transfer_experiment(config_path: str, adv_path: str = None, gmsc_
     os.makedirs(run_dir, exist_ok=True)
 
     # Prepare results without non-serializable objects
-    results_for_json = {k: v for k, v in results.items() if k != 'saved_models'}
+    # Filter out internal keys and non-serializable objects
+    def make_json_serializable(obj):
+        """Recursively convert numpy arrays and other non-JSON-serializable objects."""
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, (np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, dict):
+            return {k: make_json_serializable(v) for k, v in obj.items() if not k.startswith('_')}
+        elif isinstance(obj, (list, tuple)):
+            return [make_json_serializable(item) for item in obj]
+        elif hasattr(obj, '__dict__'):
+            # Skip non-serializable objects like models
+            return None
+        return obj
+
+    results_for_json = make_json_serializable({k: v for k, v in results.items() if not k.startswith('_') and k != 'saved_models'})
 
     # Save full results
     results_json = {
@@ -581,7 +631,7 @@ def run_domain_transfer_experiment(config_path: str, adv_path: str = None, gmsc_
         'adv_ratio': config['data'].get('adv_ratio', 0.7),
         'alignment_method': config.get('domain_alignment', {}).get('method', 'coral'),
         'results': results_for_json,
-        'analysis': analysis,
+        'analysis': make_json_serializable(analysis),
         'verdict': verdict
     }
 
@@ -637,7 +687,131 @@ def run_domain_transfer_experiment(config_path: str, adv_path: str = None, gmsc_
     except Exception as e:
         print(f"Warning: failed to save torch models: {e}")
 
+    # ==========================================================================
+    # GENERATE DOMAIN TRANSFER PLOTS
+    # ==========================================================================
+    print("\n" + "=" * 60)
+    print("GENERATING DOMAIN TRANSFER PLOTS")
+    print("=" * 60)
+
+    # Get training logs from last fold data
+    last_fold_data = results.get('_last_fold_data', {})
+    all_training_logs = last_fold_data.get('training_logs', [])
+    plot_config = results.get('_model_config', flatten_cfg(config))
+
+    print(f"  Training logs available: {len(all_training_logs)} entries")
+
+    # Extract gradient logs (subset of epoch logs with grad data)
+    grad_logs = [log for log in all_training_logs if log.get('trunk_grad_norm') is not None]
+    print(f"  Gradient logs available: {len(grad_logs)} entries")
+
+    # Extract alignment logs
+    alignment_logs = [log for log in all_training_logs
+                     if log.get('alignment_loss') is not None or log.get('alignment') is not None]
+
+    # Try to extract embeddings from the last transfer model for visualization
+    adv_embeddings = None
+    gmsc_embeddings = None
+    try:
+        saved = results.get('saved_models', {})
+        transfer_models = saved.get('transfer_models', [])
+
+        # Use last_fold_data which has the properly scaled data
+        if transfer_models and last_fold_data.get('gmsc_X_s') is not None:
+            import torch as _torch
+            device = 'cuda' if _torch.cuda.is_available() else 'cpu'
+
+            # Use last fold's model and data
+            model = transfer_models[-1]
+
+            # Use data from last_fold_data
+            adv_X_scaled = last_fold_data.get('adv_X_val_s')
+            adv_y_risk_val = last_fold_data.get('adv_y_risk_val')
+            adv_y_savings_val = last_fold_data.get('adv_y_savings_val')
+            gmsc_X_scaled = last_fold_data.get('gmsc_X_s')
+            gmsc_y_local = last_fold_data.get('gmsc_y')
+
+            if adv_X_scaled is not None and gmsc_X_scaled is not None:
+                # Subsample GMSC if too large
+                if len(gmsc_X_scaled) > 5000:
+                    indices = np.random.choice(len(gmsc_X_scaled), 5000, replace=False)
+                    gmsc_X_scaled = gmsc_X_scaled[indices]
+                    gmsc_y_local = gmsc_y_local[indices] if gmsc_y_local is not None else None
+
+                adv_ds = ADVDataset(adv_X_scaled, adv_y_risk_val, adv_y_savings_val)
+                gmsc_ds = GMSCDataset(gmsc_X_scaled, gmsc_y_local if gmsc_y_local is not None else np.zeros(len(gmsc_X_scaled)))
+
+                adv_loader = DataLoader(adv_ds, batch_size=64, shuffle=False)
+                gmsc_loader = DataLoader(gmsc_ds, batch_size=64, shuffle=False)
+
+                adv_embeddings, gmsc_embeddings = extract_latent_embeddings(
+                    model, adv_loader, gmsc_loader, device
+                )
+                print(f"  Extracted embeddings: ADV={adv_embeddings.shape}, GMSC={gmsc_embeddings.shape}")
+
+                # Store the corresponding labels for plotting (must match embedding size)
+                adv_risk_labels_for_plot = adv_y_risk_val
+            else:
+                print("  [WARN] Missing scaled data for embedding extraction")
+                adv_risk_labels_for_plot = None
+        else:
+            print("  [WARN] No transfer models or data available for embedding extraction")
+            adv_risk_labels_for_plot = None
+    except Exception as e:
+        print(f"  [WARN] Could not extract embeddings: {e}")
+        import traceback
+        traceback.print_exc()
+        adv_risk_labels_for_plot = None
+
+    # Generate all plots
+    try:
+        print(f"  Results keys: {list(results.keys())}")
+        print(f"  all_training_logs length: {len(all_training_logs)}")
+        if all_training_logs:
+            print(f"  First log entry keys: {list(all_training_logs[0].keys()) if all_training_logs else 'N/A'}")
+
+        plots = generate_all_domain_transfer_plots(
+            results=results,
+            training_logs=all_training_logs,
+            config=plot_config,
+            output_dir=run_dir,
+            adv_embeddings=adv_embeddings,
+            gmsc_embeddings=gmsc_embeddings,
+            adv_risk_labels=adv_risk_labels_for_plot,
+            grad_logs=grad_logs,
+            alignment_logs=alignment_logs
+        )
+        print(f"\nGenerated {len(plots)} domain transfer plots")
+    except Exception as e:
+        print(f"[WARN] Plot generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+
     print(f"\nResults saved to: {run_dir}")
 
     return run_dir, verdict, results
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run Domain Transfer Experiment")
+    parser.add_argument("--config", type=str, required=True,
+                        help="Path to config YAML file")
+    parser.add_argument("--adv-data", type=str, default=None,
+                        help="Path to ADV dataset CSV")
+    parser.add_argument("--gmsc-data", type=str, default=None,
+                        help="Path to GMSC dataset CSV")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Output directory (overrides config)")
+
+    args = parser.parse_args()
+
+    run_domain_transfer_experiment(
+        config_path=args.config,
+        adv_path=args.adv_data,
+        gmsc_path=args.gmsc_data,
+        output_dir=args.output_dir
+    )
+
 
