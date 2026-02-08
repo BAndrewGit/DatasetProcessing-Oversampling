@@ -7,6 +7,9 @@ seaborn==0.12.2
 PyYAML==6.0
 joblib==1.2.0
 
+# Dimensionality reduction / visualization
+umap-learn>=0.5.0
+
 # Optional: ML models (pin XGBoost to compatible version)
 xgboost==1.7.6
 

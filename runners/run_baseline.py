@@ -1,10 +1,18 @@
 # Baseline experiment runner
 # Augmentation is HARD-DISABLED - use run_augmentation_experiment.py for augmentation
 
-import argparse
-import random
 import sys
 import os
+
+# Add runners dir to path and import startup to silence warnings
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import _startup  # noqa: F401
+except ImportError:
+    os.environ.setdefault('LOKY_MAX_CPU_COUNT', str(os.cpu_count() or 4))
+
+import argparse
+import random
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

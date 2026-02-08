@@ -4,7 +4,8 @@ experiment:
   seed: 42
   output_dir: "runs"
 
-training_strategy: "pretrain_finetune"
+# Training strategy: 'joint', 'pretrain_finetune', 'optimized_mixture', or 'mixed_finetune'
+training_strategy: "mixed_finetune"
 
 data:
   adv_dataset_path: "data/processed/1_encoded.csv"
@@ -19,7 +20,12 @@ cross_validation:
   shuffle: true
 
 domain_alignment:
-  enabled: false
+  enabled: true
+  method: "dann"              # Use DANN for better domain overlap
+  weight: 0.02
+  start_epoch: 3
+  max_weight: 0.1
+  ramp_epochs: 5
 
 model:
   # === SAFE BASELINE FOR SMALL DATASET ===
@@ -27,21 +33,26 @@ model:
   finetune_trunk_lr: 0.00005
   batch_size: 16
   gmsc_batch_size: 128       # Larger batch for GMSC pretrain (fast)
-  gmsc_pretrain_samples: 5000  # Subsample GMSC (150k is too much!)
+  gmsc_pretrain_samples: 2000  # Subsample GMSC for test
   dropout: 0.15
   weight_decay: 0.001
-  patience: 8
-  max_epochs: 30
+  patience: 5
+  max_epochs: 20
 
   # Loss weights
-  gmsc_risk_weight: 0.01
+  gmsc_risk_weight: 0.05
   adv_risk_weight: 1.0
   savings_weight: 1.0
 
-  # Pretrain-finetune settings
-  pretrain_epochs: 10
-  finetune_epochs: 20
-  freeze_trunk_epochs: 3
+  # Pretrain-finetune settings (smaller for test)
+  pretrain_epochs: 5
+  finetune_epochs: 10
+  freeze_trunk_epochs: 2
+
+  # Mixed finetune settings
+  mixed_epochs: 10
+  mixed_adv_ratio: 0.85
+  mixed_gmsc_ratio: 0.15
 
   # Joint phase OFF
   enable_joint_phase: false

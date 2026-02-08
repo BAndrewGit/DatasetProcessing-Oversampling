@@ -5,12 +5,15 @@ experiment:
 
 data:
   dataset_path: "data/processed/1_encoded.csv"
-  target_type: "multitask"
-  # Expected keys used by multitask runner
 
 preprocessing:
   ignored_columns:
     - "Behavior_Risk_Level"
+  columns_to_drop:
+    - "Confidence"
+    - "Outlier"
+    - "Cluster"
+    - "Auto_Label"
 
 cross_validation:
   enabled: true
@@ -19,7 +22,26 @@ cross_validation:
   shuffle: true
 
 model:
-  trunk_hidden: 16
-  heads:
-    risk: {type: "ridge"}
-    savings: {type: "logistic_regression"}
+  # Small model for fast testing
+  hidden_dims: [32, 16]
+  dropout: 0.2
+  activation: "relu"
+
+  # Training
+  lr: 0.001
+  weight_decay: 0.01
+  batch_size: 16
+  max_epochs: 30
+  patience: 8
+
+  # Loss
+  risk_loss: "huber"
+
+  # Loss balancing
+  risk_weight: 1.0
+  savings_weight: 1.0
+  log_gradients: true
+  use_pcgrad: false
+
+  # Gradient clipping
+  clip_grad: 1.0

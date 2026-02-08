@@ -1,14 +1,19 @@
-import argparse
+# Import startup module first to silence joblib/loky warnings
 import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _startup  # noqa: F401 - silences warnings
+
+import argparse
 import yaml
 import pandas as pd
 import numpy as np
 import json
+
 # ensure project root is on sys.path so `import experiments` works when running script directly
-import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from experiments.latent_experiment import run_latent_fold
+from experiments.latent_experiment import run_latent_fold, run_latent_fold_with_tuning
 from experiments.save_model import save_sklearn_model, write_model_metadata
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
@@ -61,12 +66,89 @@ def main():
     rk = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
     fold = 0
     all_metrics = []
+    use_nested = normalized_cfg.get('use_nested_cv', False)
+
+    # Run leakage checks on first fold (fast sanity check)
+    print("\n=== LEAKAGE SANITY CHECKS ===")
+    from experiments.sanity_checks import run_all_leakage_checks
+    from sklearn.linear_model import HuberRegressor, LogisticRegression
+    first_train_idx, first_val_idx = next(rk.split(X))
+
+    # FIX 1: Always run shuffled-y test with actual model_fn
+    if task == "regression":
+        model_fn = lambda: HuberRegressor(epsilon=1.35, max_iter=500)
+    else:
+        model_fn = lambda: LogisticRegression(max_iter=500)
+
+    leakage_results = run_all_leakage_checks(
+        X.values, y.values, first_train_idx, first_val_idx,
+        feature_names=list(X.columns), task=task, model_fn=model_fn
+    )
+
+    # Save leakage check results
+    with open(os.path.join(out_root, "leakage_check.json"), "w") as f:
+        # Convert numpy types to Python types for JSON serialization
+        def convert(obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, (np.bool_,)):
+                return bool(obj)
+            if isinstance(obj, dict):
+                return {k: convert(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [convert(i) for i in obj]
+            if isinstance(obj, tuple):
+                return [convert(i) for i in obj]
+            return obj
+        json.dump(convert(leakage_results), f, indent=2)
+
+    if leakage_results['overall']['severity'] == 'CRITICAL':
+        print(f"  [CRITICAL] {leakage_results['overall']['message']}")
+        for check_name, check_result in leakage_results.items():
+            if check_name != 'overall' and check_result.get('severity') == 'CRITICAL':
+                msg = check_result.get('message', check_result.get('issues', str(check_result)))
+                print(f"    - {check_name}: {msg}")
+
+        # Show specific diagnostics for perfect baseline (most common issue)
+        if leakage_results.get('perfect_baseline', {}).get('severity') == 'CRITICAL':
+            pb = leakage_results['perfect_baseline']
+            print(f"\n  === PERFECT BASELINE DIAGNOSTIC ===")
+            print(f"  R² = {pb.get('r2', 'N/A'):.6f} (suspicious if > 0.999)")
+            print(f"  MAE = {pb.get('mae', 'N/A'):.2e}")
+            print(f"  Relative MAE = {pb.get('relative_mae', 'N/A'):.2e} (suspicious if < 1e-6)")
+            print(f"\n  POSSIBLE CAUSES:")
+            print(f"    1. Target column (or formula components) is in features")
+            print(f"    2. Scaler/PCA fitted on full data before CV split")
+            print(f"    3. Duplicate rows between train/val")
+            print(f"    4. Target is trivially recoverable from a single feature")
+            print(f"\n  TO FIX: Check RISK_SCORE_COMPONENTS exclusion, verify CV split integrity")
+
+        print("\n  [!!!] WARNING: Proceeding with experiment but results are likely INVALID!")
+        print("  [!!!] Fix the leakage issue before trusting any metrics.\n")
+    elif leakage_results['overall']['severity'] == 'WARNING':
+        print(f"  [WARNING] {leakage_results['overall']['message']}")
+    else:
+        print(f"  [OK] All leakage checks passed")
+    print("")
+
+    # Reset KFold for actual experiment
+    rk = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+
     for train_idx, val_idx in rk.split(X):
         fold += 1
         X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
         y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
         out_dir = os.path.join(out_root, f"fold_{fold}")
-        res = run_latent_fold(X_train, y_train, X_val, y_val, normalized_cfg, out_dir, task=task)
+
+        # Use nested CV tuning if enabled
+        if use_nested:
+            res = run_latent_fold_with_tuning(X_train, y_train, X_val, y_val, normalized_cfg.copy(), out_dir, task=task)
+        else:
+            res = run_latent_fold(X_train, y_train, X_val, y_val, normalized_cfg, out_dir, task=task)
         all_metrics.append(res)
 
     # Save summary.json
@@ -76,28 +158,198 @@ def main():
     # Aggregate metrics across folds
     aggregated = {}
     if all_metrics:
-        # Collect baseline metrics
+        def robust_aggregate(vals):
+            """Compute robust statistics: median, IQR, mean, std."""
+            arr = np.array([v for v in vals if v is not None and not np.isnan(v)])
+            if len(arr) == 0:
+                return None
+            return {
+                'mean': float(np.mean(arr)),
+                'std': float(np.std(arr)),
+                'median': float(np.median(arr)),
+                'iqr': float(np.percentile(arr, 75) - np.percentile(arr, 25)),
+                'p25': float(np.percentile(arr, 25)),
+                'p75': float(np.percentile(arr, 75)),
+                'min': float(np.min(arr)),
+                'max': float(np.max(arr)),
+                'n': len(arr)
+            }
+
+        # Collect baseline metrics with robust stats
         baseline_keys = all_metrics[0].get('baseline', {}).keys() if all_metrics[0].get('baseline') else []
         for key in baseline_keys:
+            if key == 'r2_warning':
+                continue
             vals = [m['baseline'].get(key) for m in all_metrics if m.get('baseline') and m['baseline'].get(key) is not None]
             if vals:
-                aggregated[f'baseline_{key}_mean'] = float(np.mean(vals))
-                aggregated[f'baseline_{key}_std'] = float(np.std(vals))
+                stats = robust_aggregate(vals)
+                if stats:
+                    aggregated[f'baseline_{key}_mean'] = stats['mean']
+                    aggregated[f'baseline_{key}_std'] = stats['std']
+                    aggregated[f'baseline_{key}_median'] = stats['median']
+                    aggregated[f'baseline_{key}_iqr'] = stats['iqr']
+                    aggregated[f'baseline_{key}_p25'] = stats['p25']
+                    aggregated[f'baseline_{key}_p75'] = stats['p75']
 
-        # Collect candidate metrics
+        # Collect candidate metrics with robust stats
         candidate_metrics = [m.get('candidate') for m in all_metrics if m.get('candidate')]
         if candidate_metrics:
-            cand_keys = candidate_metrics[0].keys()
+            cand_keys = [k for k in candidate_metrics[0].keys() if k != 'r2_warning']
             for key in cand_keys:
                 vals = [m.get(key) for m in candidate_metrics if m.get(key) is not None]
                 if vals:
-                    aggregated[f'candidate_{key}_mean'] = float(np.mean(vals))
-                    aggregated[f'candidate_{key}_std'] = float(np.std(vals))
+                    stats = robust_aggregate(vals)
+                    if stats:
+                        aggregated[f'candidate_{key}_mean'] = stats['mean']
+                        aggregated[f'candidate_{key}_std'] = stats['std']
+                        aggregated[f'candidate_{key}_median'] = stats['median']
+                        aggregated[f'candidate_{key}_iqr'] = stats['iqr']
 
         # use_synth ratio
         use_synth_count = sum(1 for m in all_metrics if m.get('use_synth'))
         aggregated['folds_using_synth'] = use_synth_count
         aggregated['total_folds'] = len(all_metrics)
+
+        # FIX 5: Fold-by-fold comparison - track improved / unchanged / degraded
+        fold_comparison = []
+        n_improved = 0
+        n_unchanged = 0
+        n_degraded = 0
+        n_catastrophic = 0
+        worst_degradation = 0.0
+        worst_fold = None
+
+        for i, m in enumerate(all_metrics):
+            baseline = m.get('baseline', {})
+            candidate = m.get('candidate', {})
+            use_synth = m.get('use_synth', False)
+
+            if baseline and candidate and use_synth:
+                base_mae = baseline.get('mae', 0)
+                cand_mae = candidate.get('mae', 0)
+
+                if base_mae > 0:
+                    delta_pct = (cand_mae - base_mae) / base_mae * 100
+                else:
+                    delta_pct = 0 if cand_mae == 0 else float('inf')
+
+                # Classify fold outcome
+                if delta_pct < -2:  # >2% improvement
+                    status = 'improved'
+                    n_improved += 1
+                elif delta_pct > 5:  # >5% degradation
+                    status = 'degraded'
+                    n_degraded += 1
+                    if delta_pct > worst_degradation:
+                        worst_degradation = delta_pct
+                        worst_fold = f"fold_{i+1}"
+                else:
+                    status = 'unchanged'
+                    n_unchanged += 1
+
+                # Check for catastrophic (>100% degradation)
+                if candidate.get('catastrophic', False) or delta_pct > 100:
+                    n_catastrophic += 1
+                    status = 'catastrophic'
+
+                fold_comparison.append({
+                    'fold': f"fold_{i+1}",
+                    'baseline_mae': base_mae,
+                    'candidate_mae': cand_mae,
+                    'delta_pct': delta_pct,
+                    'status': status,
+                    'use_synth': use_synth
+                })
+            else:
+                fold_comparison.append({
+                    'fold': f"fold_{i+1}",
+                    'baseline_mae': baseline.get('mae'),
+                    'candidate_mae': None,
+                    'delta_pct': None,
+                    'status': 'skipped' if not use_synth else 'no_candidate',
+                    'use_synth': use_synth
+                })
+
+        aggregated['fold_comparison'] = fold_comparison
+        aggregated['n_improved'] = n_improved
+        aggregated['n_unchanged'] = n_unchanged
+        aggregated['n_degraded'] = n_degraded
+        aggregated['n_catastrophic'] = n_catastrophic
+        aggregated['worst_degradation_pct'] = worst_degradation
+        aggregated['worst_fold'] = worst_fold
+
+        # Determine verdict based on STABILITY, not means
+        # FIX 5: Decision based on % folds improved and worst-case
+        synth_ratio = use_synth_count / len(all_metrics) if all_metrics else 0
+
+        # Strict verdict logic:
+        # - "useful": majority improved, no catastrophic, worst < 20%
+        # - "partial": some improved, no catastrophic
+        # - "not_useful": any catastrophic OR majority degraded OR worst > 50%
+        if n_catastrophic > 0:
+            verdict = "not_useful"
+            verdict_detail = f"CATASTROPHIC failure in {n_catastrophic} fold(s) - synthetic data REJECTED"
+        elif worst_degradation > 50:
+            verdict = "not_useful"
+            verdict_detail = f"Worst fold degradation {worst_degradation:.1f}% (>{50}%) - synthetic data REJECTED"
+        elif n_degraded > n_improved:
+            verdict = "not_useful"
+            verdict_detail = f"More folds degraded ({n_degraded}) than improved ({n_improved}) - synthetic data REJECTED"
+        elif synth_ratio < 0.5:
+            verdict = "not_useful"
+            verdict_detail = f"Only {use_synth_count}/{len(all_metrics)} folds passed quality gates"
+        elif n_improved > n_degraded and worst_degradation < 20:
+            verdict = "useful"
+            verdict_detail = f"{n_improved} improved, {n_unchanged} unchanged, {n_degraded} degraded (worst: {worst_degradation:.1f}%)"
+        else:
+            verdict = "partial"
+            verdict_detail = f"{n_improved} improved, {n_unchanged} unchanged, {n_degraded} degraded (worst: {worst_degradation:.1f}%)"
+
+        aggregated['verdict'] = verdict
+        aggregated['verdict_detail'] = verdict_detail
+
+        # Check for high variance (instability warning)
+        n_folds = len(all_metrics)
+        if n_folds < 5:
+            print(f"\n  [WARN] Only {n_folds} folds - results may be unstable. Recommend 5+ folds.")
+
+        # Report PRIMARY metrics using MEDIAN [IQR] format (robust to outliers)
+        print(f"\n  === REGRESSION METRICS (ROBUST: median [p25-p75]) ===")
+
+        def fmt_robust(key):
+            med = aggregated.get(f'baseline_{key}_median')
+            p25 = aggregated.get(f'baseline_{key}_p25')
+            p75 = aggregated.get(f'baseline_{key}_p75')
+            if med is None:
+                return "N/A"
+            return f"{med:.4f} [{p25:.3f}-{p75:.3f}]"
+
+        if 'baseline_mae_median' in aggregated:
+            print(f"  Baseline MAE:      {fmt_robust('mae')}")
+        if 'baseline_spearman_median' in aggregated:
+            print(f"  Baseline Spearman: {fmt_robust('spearman')}")
+        if 'baseline_r2_median' in aggregated:
+            r2_med = aggregated.get('baseline_r2_median', 0)
+            r2_note = " (WARNING: negative!)" if r2_med < 0 else ""
+            print(f"  Baseline R2:       {fmt_robust('r2')}{r2_note}")
+
+        # FIX 5: Report fold-by-fold stability
+        print(f"\n  === FOLD-BY-FOLD STABILITY ===")
+        print(f"  Improved:    {n_improved}/{len(all_metrics)} folds")
+        print(f"  Unchanged:   {n_unchanged}/{len(all_metrics)} folds")
+        print(f"  Degraded:    {n_degraded}/{len(all_metrics)} folds")
+        if n_catastrophic > 0:
+            print(f"  CATASTROPHIC: {n_catastrophic}/{len(all_metrics)} folds [!!!]")
+        if worst_fold:
+            print(f"  Worst case:  {worst_fold} ({worst_degradation:.1f}% degradation)")
+
+        # Show variance warning if std is high relative to mean
+        if 'baseline_mae_mean' in aggregated and 'baseline_mae_std' in aggregated:
+            cv = aggregated['baseline_mae_std'] / aggregated['baseline_mae_mean'] if aggregated['baseline_mae_mean'] > 0 else 0
+            if cv > 0.3:
+                print(f"  [WARN] High variance in MAE (CV={cv:.2f}). Results may be unstable.")
+
+        print(f"\n  [VERDICT] {verdict.upper()}: {verdict_detail}")
 
     # Save aggregated metrics.json at run root
     with open(os.path.join(out_root, "metrics.json"), "w") as f:
@@ -111,7 +363,16 @@ def main():
         X_scaled_df = pd.DataFrame(X_scaled, columns=X.columns)
 
         if task == "regression":
-            model = MLPRegressor(hidden_layer_sizes=(64,), early_stopping=True, random_state=seed, max_iter=500)
+            # Use robust model for small data (same logic as latent_experiment)
+            n_samples = len(X)
+            if n_samples < 200:
+                from sklearn.linear_model import HuberRegressor
+                model = HuberRegressor(epsilon=1.35, max_iter=500)
+            elif n_samples < 500:
+                from sklearn.linear_model import Ridge
+                model = Ridge(alpha=1.0)
+            else:
+                model = MLPRegressor(hidden_layer_sizes=(64,), early_stopping=True, random_state=seed, max_iter=500)
         else:
             model = MLPClassifier(hidden_layer_sizes=(64,), early_stopping=True, random_state=seed, max_iter=500)
 
@@ -417,30 +678,43 @@ def main():
             plt.close()
 
             # 3. Acceptance rate per synth_count
-            if 'accepted' in combined_perf.columns:
+            # FIX: Use gate_pass column and exclude baselines (is_baseline=True)
+            gate_col = 'gate_pass' if 'gate_pass' in combined_perf.columns else 'accepted'
+            if gate_col in combined_perf.columns:
                 plt.figure(figsize=(8, 5))
                 acceptance_rates = []
+
+                # Exclude baselines from acceptance calculation
+                if 'is_baseline' in combined_perf.columns:
+                    synth_only = combined_perf[~combined_perf['is_baseline'].fillna(False).astype(bool)]
+                else:
+                    synth_only = combined_perf[combined_perf['synth_count'] > 0]
+
                 for sc in synth_counts:
                     if sc == 0:
                         continue
-                    subset = combined_perf[combined_perf['synth_count'] == sc]['accepted']
+                    subset = synth_only[synth_only['synth_count'] == sc][gate_col].dropna()
                     if len(subset) > 0:
-                        rate = subset.sum() / len(subset)
+                        # Handle boolean and numeric values
+                        rate = subset.astype(float).mean()
                         acceptance_rates.append((sc, rate))
 
                 if acceptance_rates:
                     scs, rates = zip(*acceptance_rates)
-                    colors = ['green' if r > 0.5 else 'red' for r in rates]
+                    colors = ['green' if r > 0.5 else 'orange' if r > 0 else 'red' for r in rates]
                     plt.bar(range(len(scs)), rates, color=colors, alpha=0.7, edgecolor='black')
                     plt.xticks(range(len(scs)), [f'n={s}' for s in scs])
                     plt.xlabel('Synthetic Sample Count', fontsize=11)
-                    plt.ylabel('Acceptance Rate', fontsize=11)
-                    plt.title('Quality Gate Acceptance Rate per Synth Count', fontsize=12)
-                    plt.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
-                    plt.ylim(0, 1)
+                    plt.ylabel('Gate Pass Rate', fontsize=11)
+                    plt.title('Quality Gate Pass Rate per Synth Count (excluding baseline)', fontsize=12)
+                    plt.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='50% threshold')
+                    plt.ylim(0, 1.05)
+                    plt.legend()
                     plt.tight_layout()
-                    plt.savefig(os.path.join(agg_dir, 'acceptance_rate.png'), dpi=150)
+                    plt.savefig(os.path.join(agg_dir, 'gate_pass_rate.png'), dpi=150)
                     plt.close()
+                else:
+                    print("  Warning: No synth rows found for acceptance rate plot")
 
             print(f"  Saved aggregate plots to: {agg_dir}")
 

@@ -362,6 +362,13 @@ class DomainTransferModel(nn.Module):
             final_activation=None  # Use BCEWithLogitsLoss
         )
 
+        # Domain discriminator for DANN alignment
+        self.domain_discriminator = DomainDiscriminator(
+            input_dim=trunk_output_dim,
+            hidden_dims=config.get('discriminator_dims', [32, 16]),
+            dropout=dropout
+        )
+
     def forward_adv(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass for ADV domain."""
         adapted = self.adv_adapter(x)
@@ -396,6 +403,63 @@ class DomainTransferModel(nn.Module):
 # =============================================================================
 # DOMAIN ALIGNMENT LOSSES
 # =============================================================================
+
+class GradientReversalFunction(torch.autograd.Function):
+    """Gradient Reversal Layer for DANN."""
+
+    @staticmethod
+    def forward(ctx, x, lambda_):
+        ctx.lambda_ = lambda_
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.lambda_, None
+
+
+class GradientReversalLayer(nn.Module):
+    """Wrapper module for gradient reversal."""
+
+    def __init__(self, lambda_: float = 1.0):
+        super().__init__()
+        self.lambda_ = lambda_
+
+    def forward(self, x):
+        return GradientReversalFunction.apply(x, self.lambda_)
+
+    def set_lambda(self, lambda_: float):
+        self.lambda_ = lambda_
+
+
+class DomainDiscriminator(nn.Module):
+    """Domain discriminator for DANN alignment."""
+
+    def __init__(self, input_dim: int, hidden_dims: List[int] = [64, 32], dropout: float = 0.3):
+        super().__init__()
+
+        layers = []
+        prev_dim = input_dim
+
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(prev_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ])
+            prev_dim = hidden_dim
+
+        layers.append(nn.Linear(prev_dim, 1))  # Binary domain classification
+        self.discriminator = nn.Sequential(*layers)
+        self.grl = GradientReversalLayer(lambda_=1.0)
+
+    def forward(self, x, apply_grl: bool = True):
+        if apply_grl:
+            x = self.grl(x)
+        return self.discriminator(x).squeeze(-1)
+
+    def set_lambda(self, lambda_: float):
+        self.grl.set_lambda(lambda_)
+
 
 def coral_loss(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
@@ -587,6 +651,30 @@ class DomainTransferTrainer:
                 align_loss = coral_loss(adv_shared, gmsc_shared)
             elif self.alignment_method == 'mmd':
                 align_loss = mmd_loss(adv_shared, gmsc_shared)
+            elif self.alignment_method == 'dann':
+                # DANN: Domain adversarial training
+                # Discriminator tries to distinguish domains, trunk learns to fool it
+                self.model.domain_discriminator.set_lambda(current_align_weight)
+
+                # Domain labels: ADV=0, GMSC=1
+                adv_domain_labels = torch.zeros(adv_shared.size(0), device=self.device)
+                gmsc_domain_labels = torch.ones(gmsc_shared.size(0), device=self.device)
+
+                # Discriminator predictions (with gradient reversal)
+                adv_domain_pred = self.model.domain_discriminator(adv_shared, apply_grl=True)
+                gmsc_domain_pred = self.model.domain_discriminator(gmsc_shared, apply_grl=True)
+
+                # Binary cross-entropy loss
+                domain_loss_fn = nn.BCEWithLogitsLoss()
+                adv_domain_loss = domain_loss_fn(adv_domain_pred, adv_domain_labels)
+                gmsc_domain_loss = domain_loss_fn(gmsc_domain_pred, gmsc_domain_labels)
+                align_loss = (adv_domain_loss + gmsc_domain_loss) / 2
+
+                # Log discriminator accuracy
+                with torch.no_grad():
+                    adv_acc = ((adv_domain_pred < 0).float() == adv_domain_labels).float().mean()
+                    gmsc_acc = ((gmsc_domain_pred > 0).float() == gmsc_domain_labels).float().mean()
+                    loss_components['domain_discriminator_acc'] = (adv_acc.item() + gmsc_acc.item()) / 2
             else:
                 align_loss = torch.tensor(0.0, device=self.device)
 
@@ -1703,6 +1791,384 @@ def train_pretrain_finetune(
     metrics['_epoch_logs'] = trainer.training_log
 
     return metrics, trainer.model
+
+
+def train_mixed_finetune(
+    adv_X_train: np.ndarray, adv_y_risk_train: np.ndarray, adv_y_savings_train: np.ndarray,
+    adv_X_val: np.ndarray, adv_y_risk_val: np.ndarray, adv_y_savings_val: np.ndarray,
+    gmsc_X_train: np.ndarray, gmsc_y_train: np.ndarray,
+    config: Dict, seed: int
+) -> Tuple[Dict, nn.Module]:
+    """
+    UPGRADE: Mixed Fine-tune Training Strategy.
+
+    Addresses the "separate islands" problem by combining:
+    1. Phase 1: Pretrain on GMSC (same as before)
+    2. Phase 2: Mixed fine-tune with 70-90% ADV + 10-30% GMSC rehearsal
+       - Prevents catastrophic forgetting of GMSC representation
+       - Scheduled CORAL/MMD alignment (starts late, small weight)
+       - Discriminative LR: trunk uses smaller LR than heads
+
+    Key differences from pretrain_finetune:
+    - Phase 2 keeps using GMSC samples (rehearsal)
+    - Alignment loss helps overlap domains in latent space
+    - Gradient logging for debugging dominance issues
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Normalize y arrays
+    adv_y_risk_train = np.asarray(adv_y_risk_train).reshape(-1)
+    adv_y_savings_train = np.asarray(adv_y_savings_train).reshape(-1)
+    adv_y_risk_val = np.asarray(adv_y_risk_val).reshape(-1)
+    adv_y_savings_val = np.asarray(adv_y_savings_val).reshape(-1)
+    gmsc_y_train = np.asarray(gmsc_y_train).reshape(-1)
+
+    # Config extraction
+    pretrain_epochs = config.get('pretrain_epochs', 15)
+    mixed_epochs = config.get('mixed_epochs', 30)
+    freeze_trunk_epochs = config.get('freeze_trunk_epochs', 3)
+
+    lr = config.get('lr', 0.0005)
+    trunk_lr = config.get('finetune_trunk_lr', lr * 0.1)
+    batch_size = config.get('batch_size', 16)
+    gmsc_batch_size = config.get('gmsc_batch_size', 64)
+    patience = config.get('patience', 10)
+    weight_decay = config.get('weight_decay', 0.001)
+    clip_grad = config.get('clip_grad', 1.0)
+
+    mixed_adv_ratio = config.get('mixed_adv_ratio', 0.85)
+    mixed_gmsc_ratio = config.get('mixed_gmsc_ratio', 0.15)
+
+    # Alignment config
+    alignment_enabled = config.get('alignment_enabled', False)
+    alignment_method = config.get('alignment_method', 'coral')
+    alignment_weight = config.get('alignment_weight', 0.01)
+    alignment_start_epoch = config.get('alignment_start_epoch', 15)
+    alignment_max_weight = config.get('alignment_max_weight', 0.03)
+    alignment_ramp_epochs = config.get('alignment_ramp_epochs', 10)
+
+    gmsc_risk_weight = config.get('gmsc_risk_weight', 0.05)
+
+    print("\n" + "=" * 70)
+    print("MIXED FINETUNE TRAINING STRATEGY")
+    print("=" * 70)
+    print(f"  Phase 1 (Pretrain): {pretrain_epochs} epochs on GMSC")
+    print(f"  Phase 2 (Mixed):    {mixed_epochs} epochs ({mixed_adv_ratio*100:.0f}% ADV / {mixed_gmsc_ratio*100:.0f}% GMSC)")
+    print(f"  Trunk freeze:       {freeze_trunk_epochs} epochs at Phase 2 start")
+    print(f"  Learning rates:     heads={lr}, trunk={trunk_lr}")
+    print(f"  Alignment:          {alignment_enabled} (method={alignment_method})")
+    if alignment_enabled:
+        print(f"    Start epoch:      {alignment_start_epoch}")
+        print(f"    Weight:           {alignment_weight} -> {alignment_max_weight}")
+    print("=" * 70)
+
+    # Compute pos_weight for GMSC
+    gmsc_pos_weight = compute_gmsc_pos_weight(gmsc_y_train)
+    print(f"GMSC pos_weight: {gmsc_pos_weight.item():.2f}")
+
+    # Create model
+    model = DomainTransferModel(
+        adv_input_dim=adv_X_train.shape[1],
+        gmsc_input_dim=gmsc_X_train.shape[1],
+        config=config
+    )
+    model.to(device)
+
+    # Create datasets
+    adv_train_ds = ADVDataset(adv_X_train, adv_y_risk_train, adv_y_savings_train)
+    adv_val_ds = ADVDataset(adv_X_val, adv_y_risk_val, adv_y_savings_val)
+
+    # Subsample GMSC for pretrain
+    gmsc_pretrain_samples = config.get('gmsc_pretrain_samples', 5000)
+    if len(gmsc_X_train) > gmsc_pretrain_samples:
+        rng = np.random.RandomState(seed)
+        indices = rng.choice(len(gmsc_X_train), size=gmsc_pretrain_samples, replace=False)
+        gmsc_X_subset = gmsc_X_train[indices]
+        gmsc_y_subset = gmsc_y_train[indices]
+    else:
+        gmsc_X_subset = gmsc_X_train
+        gmsc_y_subset = gmsc_y_train
+
+    gmsc_train_ds = GMSCDataset(gmsc_X_subset, gmsc_y_subset)
+
+    adv_train_loader = DataLoader(adv_train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+    adv_val_loader = DataLoader(adv_val_ds, batch_size=batch_size, shuffle=False)
+    gmsc_train_loader = DataLoader(gmsc_train_ds, batch_size=gmsc_batch_size, shuffle=True, drop_last=False)
+
+    # Loss functions
+    gmsc_loss_fn = nn.BCEWithLogitsLoss(pos_weight=gmsc_pos_weight.to(device))
+    adv_risk_loss_fn = nn.HuberLoss() if config.get('risk_loss', 'huber') == 'huber' else nn.MSELoss()
+    savings_loss_fn = nn.BCEWithLogitsLoss()
+
+    training_log = []
+
+    # =========================================================================
+    # PHASE 1: PRETRAIN ON GMSC
+    # =========================================================================
+    print(f"\n=== PHASE 1: PRETRAIN ON GMSC ({pretrain_epochs} epochs) ===")
+
+    pretrain_params = list(model.gmsc_adapter.parameters()) + \
+                     list(model.shared_trunk.parameters()) + \
+                     list(model.gmsc_risk_head.parameters())
+
+    optimizer = optim.Adam(pretrain_params, lr=lr, weight_decay=weight_decay)
+
+    best_pretrain_loss = float('inf')
+    best_pretrain_state = None
+
+    for epoch in range(pretrain_epochs):
+        model.train()
+        epoch_losses = []
+
+        for batch in gmsc_train_loader:
+            optimizer.zero_grad()
+            features = batch['features'].to(device)
+            target = batch['risk_target'].to(device)
+
+            output = model.forward(features, domain=1)
+            loss = gmsc_loss_fn(output['risk'], target)
+
+            loss.backward()
+            if clip_grad:
+                torch.nn.utils.clip_grad_norm_(pretrain_params, clip_grad)
+            optimizer.step()
+
+            epoch_losses.append(loss.item())
+
+        avg_loss = np.mean(epoch_losses)
+        training_log.append({'phase': 'pretrain', 'epoch': epoch + 1, 'loss': avg_loss})
+
+        if avg_loss < best_pretrain_loss:
+            best_pretrain_loss = avg_loss
+            best_pretrain_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_pretrain_state:
+        model.load_state_dict(best_pretrain_state)
+    print(f"  Pretrain complete. Best loss: {best_pretrain_loss:.4f}")
+
+    # =========================================================================
+    # PHASE 2: MIXED FINE-TUNE (ADV + GMSC rehearsal + alignment)
+    # =========================================================================
+    print(f"\n=== PHASE 2: MIXED FINE-TUNE ({mixed_epochs} epochs) ===")
+    print(f"  Ratio: {mixed_adv_ratio*100:.0f}% ADV / {mixed_gmsc_ratio*100:.0f}% GMSC")
+
+    # Discriminative LR: trunk uses smaller LR
+    param_groups = [
+        {'params': model.adv_adapter.parameters(), 'lr': lr, 'name': 'adv_adapter'},
+        {'params': model.adv_risk_head.parameters(), 'lr': lr, 'name': 'adv_risk_head'},
+        {'params': model.savings_head.parameters(), 'lr': lr, 'name': 'savings_head'},
+        {'params': model.shared_trunk.parameters(), 'lr': trunk_lr, 'name': 'trunk'},
+        {'params': model.gmsc_adapter.parameters(), 'lr': trunk_lr, 'name': 'gmsc_adapter'},  # Keep GMSC frozen-ish
+        {'params': model.gmsc_risk_head.parameters(), 'lr': trunk_lr, 'name': 'gmsc_head'},
+    ]
+
+    optimizer = optim.Adam(param_groups, weight_decay=weight_decay)
+
+    print(f"  LR heads: {lr}, LR trunk/gmsc: {trunk_lr}")
+
+    # Trunk freeze at start of Phase 2
+    trunk_frozen = False
+    if freeze_trunk_epochs > 0:
+        set_requires_grad(model.shared_trunk, False)
+        trunk_frozen = True
+        print(f"  Trunk FROZEN for first {freeze_trunk_epochs} epochs")
+
+    best_val_loss = float('inf')
+    best_metrics = None
+    best_state = None
+    patience_counter = 0
+
+    def get_alignment_weight(epoch: int) -> float:
+        """Scheduled alignment weight."""
+        if not alignment_enabled:
+            return 0.0
+        if epoch < alignment_start_epoch:
+            return 0.0
+        epochs_since = epoch - alignment_start_epoch
+        if epochs_since < alignment_ramp_epochs:
+            return alignment_weight + (alignment_max_weight - alignment_weight) * (epochs_since / alignment_ramp_epochs)
+        return alignment_max_weight
+
+    for epoch in range(mixed_epochs):
+        # Unfreeze trunk after initial epochs
+        if trunk_frozen and epoch >= freeze_trunk_epochs:
+            set_requires_grad(model.shared_trunk, True)
+            trunk_frozen = False
+            print(f"  Epoch {epoch + 1}: Trunk UNFROZEN")
+
+        model.train()
+        epoch_losses = []
+        epoch_components = []
+
+        gmsc_iter = iter(gmsc_train_loader)
+        current_align_weight = get_alignment_weight(epoch)
+
+        for adv_batch in adv_train_loader:
+            optimizer.zero_grad()
+
+            # ADV forward
+            adv_features = adv_batch['features'].to(device)
+            adv_risk_target = adv_batch['risk_target'].to(device)
+            adv_savings_target = adv_batch['savings_target'].to(device)
+
+            adv_output = model.forward(adv_features, domain=0)
+            adv_risk_loss = adv_risk_loss_fn(adv_output['risk'], adv_risk_target)
+            savings_loss = savings_loss_fn(adv_output['savings'], adv_savings_target)
+
+            total_loss = adv_risk_loss + savings_loss
+            components = {'adv_risk': adv_risk_loss.item(), 'savings': savings_loss.item()}
+
+            # GMSC rehearsal (probabilistic based on ratio)
+            if np.random.random() < mixed_gmsc_ratio:
+                try:
+                    gmsc_batch = next(gmsc_iter)
+                except StopIteration:
+                    gmsc_iter = iter(gmsc_train_loader)
+                    gmsc_batch = next(gmsc_iter)
+
+                gmsc_features = gmsc_batch['features'].to(device)
+                gmsc_target = gmsc_batch['risk_target'].to(device)
+
+                gmsc_output = model.forward(gmsc_features, domain=1)
+                gmsc_loss = gmsc_loss_fn(gmsc_output['risk'], gmsc_target)
+
+                total_loss = total_loss + gmsc_risk_weight * gmsc_loss
+                components['gmsc_risk'] = gmsc_loss.item()
+
+                # Alignment loss (if enabled and past start epoch)
+                if current_align_weight > 0:
+                    adv_shared = adv_output['shared']
+                    gmsc_shared = gmsc_output['shared']
+
+                    if alignment_method == 'coral':
+                        align_loss = coral_loss(adv_shared, gmsc_shared)
+                    elif alignment_method == 'mmd':
+                        align_loss = mmd_loss(adv_shared, gmsc_shared)
+                    elif alignment_method == 'dann':
+                        # DANN: Domain adversarial training with gradient reversal
+                        model.domain_discriminator.set_lambda(current_align_weight)
+
+                        adv_domain_labels = torch.zeros(adv_shared.size(0), device=device)
+                        gmsc_domain_labels = torch.ones(gmsc_shared.size(0), device=device)
+
+                        adv_domain_pred = model.domain_discriminator(adv_shared, apply_grl=True)
+                        gmsc_domain_pred = model.domain_discriminator(gmsc_shared, apply_grl=True)
+
+                        domain_loss_fn = nn.BCEWithLogitsLoss()
+                        align_loss = (domain_loss_fn(adv_domain_pred, adv_domain_labels) +
+                                     domain_loss_fn(gmsc_domain_pred, gmsc_domain_labels)) / 2
+                    else:
+                        align_loss = torch.tensor(0.0, device=device)
+
+                    total_loss = total_loss + current_align_weight * align_loss
+                    components['alignment'] = align_loss.item()
+                    components['alignment_weight'] = current_align_weight
+
+            total_loss.backward()
+            if clip_grad:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            optimizer.step()
+
+            epoch_losses.append(total_loss.item())
+            epoch_components.append(components)
+
+        # Validation
+        val_metrics = _evaluate_model_on_adv(model, adv_val_loader, device)
+        val_loss = val_metrics['risk_mae']
+
+        # Log epoch
+        log_entry = {
+            'phase': 'mixed', 'epoch': epoch + 1,
+            'train_loss': np.mean(epoch_losses),
+            'val_mae': val_metrics['risk_mae'],
+            'val_f1': val_metrics['savings_macro_f1'],
+            'alignment_weight': current_align_weight
+        }
+        # Aggregate component losses
+        for key in ['adv_risk', 'savings', 'gmsc_risk', 'alignment']:
+            vals = [c.get(key) for c in epoch_components if c.get(key) is not None]
+            if vals:
+                log_entry[key] = float(np.mean(vals))
+        training_log.append(log_entry)
+
+        # Early stopping with best model checkpoint
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_metrics = val_metrics.copy()
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"  Early stopping at epoch {epoch + 1}")
+                break
+
+    # Restore best model
+    if best_state:
+        model.load_state_dict(best_state)
+
+    print(f"  Mixed fine-tune complete. Best MAE: {best_val_loss:.4f}")
+
+    # Add training log
+    if best_metrics is None:
+        best_metrics = val_metrics
+    best_metrics['_epoch_logs'] = training_log
+
+    return best_metrics, model
+
+
+def _evaluate_model_on_adv(model: nn.Module, adv_loader: DataLoader, device: str) -> Dict:
+    """Helper to evaluate model on ADV validation data."""
+    model.eval()
+
+    all_risk_preds, all_risk_true = [], []
+    all_savings_preds, all_savings_true = [], []
+
+    with torch.no_grad():
+        for batch in adv_loader:
+            features = batch['features'].to(device)
+            risk_target = batch['risk_target']
+            savings_target = batch['savings_target']
+
+            output = model.forward(features, domain=0)
+
+            all_risk_preds.extend(output['risk'].cpu().numpy().flatten())
+            all_risk_true.extend(risk_target.cpu().numpy().flatten())
+
+            savings_probs = torch.sigmoid(output['savings'])
+            all_savings_preds.extend((savings_probs > 0.5).cpu().numpy().flatten().astype(int))
+            all_savings_true.extend(savings_target.cpu().numpy().flatten().astype(int))
+
+    y_true = np.array(all_risk_true)
+    y_pred = np.array(all_risk_preds)
+
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    risk_r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    metrics = {
+        'risk_mae': mean_absolute_error(y_true, y_pred),
+        'risk_rmse': np.sqrt(mean_squared_error(y_true, y_pred)),
+        'risk_r2': risk_r2,
+        'savings_macro_f1': f1_score(all_savings_true, all_savings_preds, average='macro', zero_division=0),
+        'savings_accuracy': accuracy_score(all_savings_true, all_savings_preds),
+        'savings_precision': precision_score(all_savings_true, all_savings_preds, average='macro', zero_division=0),
+        'savings_recall': recall_score(all_savings_true, all_savings_preds, average='macro', zero_division=0)
+    }
+
+    if np.std(y_true) > 1e-8 and np.std(y_pred) > 1e-8:
+        try:
+            metrics['risk_spearman'] = spearmanr(y_true, y_pred)[0]
+        except Exception:
+            metrics['risk_spearman'] = 0.0
+    else:
+        metrics['risk_spearman'] = 0.0
+
+    return metrics
 
 
 # =============================================================================

@@ -267,8 +267,8 @@ def plot_learning_curves(
             ax1_twin = ax1.twinx()
             ax1_twin.plot(valid_epochs[:len(valid_train_loss)], valid_train_loss,
                          'b--', linewidth=1.5, alpha=0.5, label='Train Loss')
-            ax1_twin.set_ylabel('Train Loss', color='blue', alpha=0.5)
-            ax1_twin.tick_params(axis='y', labelcolor='blue', alpha=0.5)
+            ax1_twin.set_ylabel('Train Loss', color='blue')
+            ax1_twin.tick_params(axis='y', labelcolor='blue')
 
         ax1.set_xlabel('Epoch')
         ax1.set_ylabel('Val Risk MAE', color='blue')
@@ -713,23 +713,33 @@ def generate_all_multitask_plots(
 
     # 2) Learning Curves
     if epoch_logs:
-        # Individual model curves
-        for model_name, logs in epoch_logs.items():
-            if logs:
-                try:
-                    path = plot_learning_curves(logs, plots_dir, f'learning_curves_{model_name}.png', model_name)
-                    if path:
-                        generated_plots[f'learning_curves_{model_name}'] = path
-                except Exception as e:
-                    print(f"[ERROR] Failed to generate learning curves for {model_name}: {e}")
+        # Handle different formats: list (single model) or dict (multiple models)
+        if isinstance(epoch_logs, list):
+            # Single model's logs - wrap in dict with 'multitask' key
+            try:
+                path = plot_learning_curves(epoch_logs, plots_dir, 'learning_curves_multitask.png', 'multitask')
+                if path:
+                    generated_plots['learning_curves_multitask'] = path
+            except Exception as e:
+                print(f"[ERROR] Failed to generate learning curves: {e}")
+        elif isinstance(epoch_logs, dict):
+            # Multiple models - iterate
+            for model_name, logs in epoch_logs.items():
+                if logs:
+                    try:
+                        path = plot_learning_curves(logs, plots_dir, f'learning_curves_{model_name}.png', model_name)
+                        if path:
+                            generated_plots[f'learning_curves_{model_name}'] = path
+                    except Exception as e:
+                        print(f"[ERROR] Failed to generate learning curves for {model_name}: {e}")
 
-        # Comparison plot
-        try:
-            path = plot_learning_curves_comparison(epoch_logs, plots_dir, 'learning_curves_comparison.png')
-            if path:
-                generated_plots['learning_curves_comparison'] = path
-        except Exception as e:
-            print(f"[ERROR] Failed to generate learning curves comparison: {e}")
+            # Comparison plot
+            try:
+                path = plot_learning_curves_comparison(epoch_logs, plots_dir, 'learning_curves_comparison.png')
+                if path:
+                    generated_plots['learning_curves_comparison'] = path
+            except Exception as e:
+                print(f"[ERROR] Failed to generate learning curves comparison: {e}")
 
     # 3) Gradient Conflict (if data available)
     if grad_logs:

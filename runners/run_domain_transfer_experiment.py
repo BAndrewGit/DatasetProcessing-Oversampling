@@ -5,6 +5,13 @@
 import sys
 import os
 
+# Add runners dir to path and import startup to silence warnings
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import _startup  # noqa: F401
+except ImportError:
+    os.environ.setdefault('LOKY_MAX_CPU_COUNT', str(os.cpu_count() or 4))
+
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -325,7 +332,15 @@ def run_domain_transfer_cv(
         # Experiment 2: ADV + GMSC transfer (using selected strategy)
         print(f"  Training ADV + GMSC transfer model (strategy: {training_strategy})...")
 
-        if training_strategy == 'pretrain_finetune':
+        if training_strategy == 'mixed_finetune':
+            from experiments.domain_transfer import train_mixed_finetune
+            transfer_m, transfer_model = train_mixed_finetune(
+                adv_X_train_s, adv_y_risk_train, adv_y_savings_train,
+                adv_X_val_s, adv_y_risk_val, adv_y_savings_val,
+                gmsc_X_s, gmsc_y,
+                model_config, fold_seed
+            )
+        elif training_strategy == 'pretrain_finetune':
             transfer_m, transfer_model = train_pretrain_finetune(
                 adv_X_train_s, adv_y_risk_train, adv_y_savings_train,
                 adv_X_val_s, adv_y_risk_val, adv_y_savings_val,

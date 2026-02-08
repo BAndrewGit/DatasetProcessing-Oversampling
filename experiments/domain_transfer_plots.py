@@ -570,14 +570,37 @@ def plot_latent_embeddings(adv_embeddings: np.ndarray, gmsc_embeddings: np.ndarr
 
     overlap_ratio = 1 - min(1, centroid_dist / (2 * avg_spread))
 
-    if overlap_ratio > 0.7:
-        verdict = f"✓ High overlap ({overlap_ratio:.2f})"
+    # More robust metric: kNN proximity
+    # What fraction of ADV samples have a GMSC neighbor within median intra-ADV distance?
+    try:
+        from sklearn.neighbors import NearestNeighbors
+
+        # Compute median intra-ADV distance
+        nn_adv = NearestNeighbors(n_neighbors=2).fit(adv_2d)
+        adv_dists, _ = nn_adv.kneighbors(adv_2d)
+        median_adv_dist = np.median(adv_dists[:, 1])
+
+        # For each ADV, find distance to nearest GMSC
+        nn_gmsc = NearestNeighbors(n_neighbors=1).fit(gmsc_2d)
+        cross_dists, _ = nn_gmsc.kneighbors(adv_2d)
+
+        # Fraction with GMSC neighbor within threshold
+        knn_overlap = np.mean(cross_dists[:, 0] < 2 * median_adv_dist)
+
+        # Combined metric
+        final_overlap = 0.5 * overlap_ratio + 0.5 * knn_overlap
+    except:
+        knn_overlap = overlap_ratio
+        final_overlap = overlap_ratio
+
+    if final_overlap > 0.5:
+        verdict = f"Good overlap ({final_overlap:.2f})"
         color = 'green'
-    elif overlap_ratio > 0.4:
-        verdict = f"Moderate overlap ({overlap_ratio:.2f})"
+    elif final_overlap > 0.2:
+        verdict = f"Moderate overlap ({final_overlap:.2f})"
         color = 'orange'
     else:
-        verdict = f"⚠️ Separate islands ({overlap_ratio:.2f})"
+        verdict = f"Separate islands ({final_overlap:.2f})"
         color = 'red'
 
     ax.text(0.02, 0.98, verdict, transform=ax.transAxes, ha='left', va='top',

@@ -117,6 +117,7 @@ def test_multitask_config_validation():
     validate_config(config, mode='multitask')
 
 
+@pytest.mark.slow
 def test_multitask_training_runs():
     """Test that multitask training completes without errors."""
     # Create small dummy dataset

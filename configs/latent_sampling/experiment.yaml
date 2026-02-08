@@ -1,14 +1,73 @@
+# Latent Space Oversampling Experiment Configuration
+# FIXES: Real utility gates, fair comparison, nested CV
+
 target: Risk_Score
-task: regression          # or classification
+task: regression
+
+# Cross-validation: outer loop for reporting
 n_splits: 5
+n_repeats: 1
 seed: 42
-pca_candidates: [30,25,20,15,10,8,5,3]
-k_candidates: [2,3,4,5]
-min_cluster_frac: 0.05
+
+# Nested CV: inner loop for tuning (prevents selection bias)
+use_nested_cv: true
+inner_splits: 3
+
+# Model type for regression
+model_type: auto
+
+# PCA Configuration
+pca_candidates: [10, 8, 5]
+
+# SAMPLING STRATEGY
+use_continuous_sampler: always
+
+# =============================================================================
+# TUNING GRID (minimal - not festival)
+# =============================================================================
+tuning:
+  # Methods to try
+  methods: [smote_latent, knn_mixup, gaussian_noise]
+
+  # kNN neighbors
+  k_neighbors: [3, 5, 7]
+
+  # Noise scale for gaussian_noise
+  noise_scale: [0.05, 0.1, 0.2]
+
+  # Memorization percentile threshold
+  memo_percentile: [1, 5]
+
+  # Synthetic counts to try (just 2-3 values)
+  synth_counts: [20, 50]
+
+  # Objective: MAE + stability penalty
+  # final_score = MAE + stability_weight * std(MAE across inner folds)
+  stability_weight: 0.5
+
+# Default values (used if tuning disabled)
+continuous_method: smote_latent
+k_neighbors: 5
+noise_scale: 0.1
+memorization_percentile: 5
+
+# SAMPLING CONFIGURATION
 per_cluster_cap_frac: 0.2
 global_cap_frac: 0.3
-sampling_method: gaussian
-memorization_min_threshold: 1e-6
+n_coverage_bins: 5
+synth_weight: 0.3
+
+# Synth grid for ablation (reduced)
+synth_grid: [0, 20, 50]
+
+# QUALITY GATES (STRICT - includes utility on val)
+quality_thresholds:
+  memorization_min: 0.0
+  memorization_median: 0.0
+  two_sample_auc: 0.75
+  utility_delta: 0.10  # augmented MAE <= baseline * 1.10
+
+stability_repeats: 3
 onehot_groups: null
 forbidden_column: Behavior_Risk_Level
 

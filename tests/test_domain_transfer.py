@@ -230,9 +230,10 @@ def test_mmd_loss_different_distribution():
 
 
 # =============================================================================
-# TRAINING TESTS
+# TRAINING TESTS (marked slow - can freeze on some systems)
 # =============================================================================
 
+@pytest.mark.slow
 def test_train_adv_only_returns_metrics():
     """Test ADV-only training returns expected metrics."""
     np.random.seed(42)
@@ -279,6 +280,7 @@ def test_train_adv_only_returns_metrics():
     assert model is not None
 
 
+@pytest.mark.slow
 def test_train_with_gmsc_transfer_returns_metrics():
     """Test transfer training returns expected metrics."""
     np.random.seed(42)

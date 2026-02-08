@@ -1,10 +1,18 @@
 # Multi-task Learning Experiment Runner
 # Ablation: single-task vs multi-task comparison
 
-import argparse
-import random
 import sys
 import os
+
+# Add runners dir to path and import startup to silence warnings
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import _startup  # noqa: F401
+except ImportError:
+    os.environ.setdefault('LOKY_MAX_CPU_COUNT', str(os.cpu_count() or 4))
+
+import argparse
+import random
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -54,6 +62,32 @@ def preprocess_multitask_data(df, config):
     # Hard constraint: Behavior_Risk_Level must be excluded
     if 'Behavior_Risk_Level' not in ignored:
         ignored.append('Behavior_Risk_Level')
+
+    # CRITICAL: Save_Money_No is the complement of Save_Money_Yes - must exclude!
+    if 'Save_Money_No' not in ignored:
+        ignored.append('Save_Money_No')
+        print("EXCLUDED (complement of target): Save_Money_No")
+
+    # CRITICAL: Exclude features with very high correlation to savings target (quasi-leakage)
+    # These make the task trivially easy and don't generalize
+    SAVINGS_QUASI_LEAKAGE_THRESHOLD = 0.7
+    savings_target = 'Save_Money_Yes'
+    if savings_target in df.columns:
+        high_corr_cols = []
+        for col in df.columns:
+            if col in [savings_target, 'Save_Money_No']:
+                continue
+            try:
+                corr = abs(df[col].corr(df[savings_target]))
+                if corr >= SAVINGS_QUASI_LEAKAGE_THRESHOLD:
+                    high_corr_cols.append((col, corr))
+            except:
+                pass
+        if high_corr_cols:
+            for col, corr in high_corr_cols:
+                if col not in ignored:
+                    ignored.append(col)
+            print(f"EXCLUDED (quasi-leakage, r>{SAVINGS_QUASI_LEAKAGE_THRESHOLD}): {[c for c,_ in high_corr_cols]}")
 
     # Targets
     risk_target = 'Risk_Score'
@@ -137,9 +171,31 @@ def run_multitask_cv(X, y_risk, y_savings, config):
     # FIX 3: Use RepeatedStratifiedKFold for proper class balance in each fold
     cv = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=seed)
 
+    # SANITY CHECK: Verify no feature is perfectly correlated with target
+    try:
+        from experiments.sanity_checks import check_multitask_f1_leakage
+        feature_names = list(X.columns) if hasattr(X, 'columns') else None
+        leakage_check = check_multitask_f1_leakage(X.values if hasattr(X, 'values') else X,
+                                                   y_savings.values if hasattr(y_savings, 'values') else y_savings,
+                                                   feature_names, seed)
+        if leakage_check['likely_leakage']:
+            print("\n*** LEAKAGE WARNING ***")
+            for check in leakage_check['checks']:
+                print(f"  - {check}")
+            print(f"  Suspicious features: {leakage_check['suspicious_features']}")
+            print("*** END WARNING ***\n")
+    except Exception as e:
+        print(f"  (leakage check skipped: {e})")
+
     risk_only_metrics = []
     savings_only_metrics = []
     multitask_metrics = []
+
+    # Collect gradient logs and thresholds from multitask training
+    all_gradient_logs = []
+    all_thresholds = []
+    all_training_logs = []
+
     # Keep last model for each ablation to save
     saved_models = {'risk_only': None, 'savings_only': None, 'multitask': None}
 
@@ -157,7 +213,8 @@ def run_multitask_cv(X, y_risk, y_savings, config):
             X_train, y_risk_train, X_val, y_risk_val,
             config['model'], seed + fold_idx
         )
-        risk_only_metrics.append(risk_metrics)
+        # Filter out internal keys starting with '_'
+        risk_only_metrics.append({k: v for k, v in risk_metrics.items() if not k.startswith('_')})
         saved_models['risk_only'] = risk_model
 
         # Savings-only
@@ -165,7 +222,7 @@ def run_multitask_cv(X, y_risk, y_savings, config):
             X_train, y_savings_train, X_val, y_savings_val,
             config['model'], seed + fold_idx
         )
-        savings_only_metrics.append(savings_metrics)
+        savings_only_metrics.append({k: v for k, v in savings_metrics.items() if not k.startswith('_')})
         saved_models['savings_only'] = savings_model
 
         # Multi-task
@@ -174,7 +231,17 @@ def run_multitask_cv(X, y_risk, y_savings, config):
             X_val, y_risk_val, y_savings_val,
             config['model'], seed + fold_idx
         )
-        multitask_metrics.append(mt_metrics)
+
+        # Extract gradient logs and threshold from metrics
+        if '_gradient_logs' in mt_metrics:
+            all_gradient_logs.extend(mt_metrics['_gradient_logs'])
+        if '_optimal_threshold' in mt_metrics:
+            all_thresholds.append(mt_metrics['_optimal_threshold'])
+        if '_training_log' in mt_metrics:
+            all_training_logs.append(mt_metrics['_training_log'])
+
+        # Filter out internal keys for aggregation
+        multitask_metrics.append({k: v for k, v in mt_metrics.items() if not k.startswith('_')})
         saved_models['multitask'] = mt_model
 
     # Aggregate results
@@ -184,11 +251,25 @@ def run_multitask_cv(X, y_risk, y_savings, config):
         'multitask': _aggregate_metrics(multitask_metrics)
     }
 
+    # Add gradient logs and threshold info for plotting
+    if all_gradient_logs:
+        results['grad_logs'] = all_gradient_logs
+    if all_thresholds:
+        results['thresholds'] = {
+            'mean': float(np.mean(all_thresholds)),
+            'std': float(np.std(all_thresholds)),
+            'all': all_thresholds
+        }
+        print(f"\n  Optimal savings threshold: {np.mean(all_thresholds):.3f} ± {np.std(all_thresholds):.3f}")
+    if all_training_logs:
+        # Keep only last fold's training log for plotting (to avoid huge data)
+        results['epoch_logs'] = all_training_logs[-1]
+
     return results, saved_models
 
 
 def _aggregate_metrics(metrics_list):
-    # Aggregate metrics across folds
+    """Aggregate metrics across folds with mean, std, median, and IQR."""
     if not metrics_list:
         return {}
 
@@ -199,70 +280,63 @@ def _aggregate_metrics(metrics_list):
         try:
             values = [float(m[metric_name]) for m in metrics_list if m.get(metric_name) is not None]
             if values:
+                arr = np.array(values)
                 aggregated[metric_name] = {
-                    'mean': float(np.nanmean(values)),
-                    'std': float(np.nanstd(values)),
+                    'mean': float(np.nanmean(arr)),
+                    'std': float(np.nanstd(arr)),
+                    'median': float(np.nanmedian(arr)),
+                    'iqr': float(np.percentile(arr, 75) - np.percentile(arr, 25)),
+                    'p25': float(np.percentile(arr, 25)),
+                    'p75': float(np.percentile(arr, 75)),
                     'all': values
                 }
         except (TypeError, ValueError):
-            pass  # Skip non-numeric metrics
+            pass
 
     return aggregated
 
 
 def print_results(results):
-    """Print comparison of all three experiments."""
+    """Print comparison of all three experiments with median (IQR) for robustness."""
     print("\n" + "=" * 80)
-    print("MULTI-TASK ABLATION RESULTS")
+    print("MULTI-TASK ABLATION RESULTS (median [IQR])")
     print("=" * 80)
 
-    # Risk metrics
+    def fmt(m):
+        """Format metric as median [p25-p75]."""
+        if not m:
+            return "N/A"
+        return f"{m.get('median', 0):.4f} [{m.get('p25', 0):.3f}-{m.get('p75', 0):.3f}]"
+
+    # Risk metrics - focus on MAE and Spearman (not R²)
     print("\n--- RISK REGRESSION (Risk_Score) ---")
-    print(f"{'Experiment':<20} {'MAE':<15} {'RMSE':<15} {'Spearman rho':<15} {'R2':<15}")
-    print("-" * 80)
+    print(f"{'Experiment':<22} {'MAE (lower=better)':<25} {'Spearman (higher=better)':<25}")
+    print("-" * 75)
 
     for exp_name in ['risk_only', 'multitask']:
         if exp_name not in results:
             continue
         exp_results = results[exp_name]
-
         mae = exp_results.get('risk_mae', {})
-        rmse = exp_results.get('risk_rmse', {})
         spearman = exp_results.get('risk_spearman', {})
-        r2 = exp_results.get('risk_r2', {})
-
         label = "Risk-only (baseline)" if exp_name == 'risk_only' else "Multi-task"
-
-        print(f"{label:<20} "
-              f"{mae.get('mean', 0):.4f}±{mae.get('std', 0):.4f}   "
-              f"{rmse.get('mean', 0):.4f}±{rmse.get('std', 0):.4f}   "
-              f"{spearman.get('mean', 0):.4f}±{spearman.get('std', 0):.4f}   "
-              f"{r2.get('mean', 0):.4f}±{r2.get('std', 0):.4f}")
+        print(f"{label:<22} {fmt(mae):<25} {fmt(spearman):<25}")
 
     # Savings metrics
     print("\n--- SAVINGS CLASSIFICATION (Save_Money_Yes) ---")
-    print(f"{'Experiment':<20} {'Macro-F1':<15} {'Accuracy':<15} {'Precision':<15} {'Recall':<15}")
-    print("-" * 80)
+    print(f"{'Experiment':<22} {'Macro-F1 (higher=better)':<25} {'Accuracy':<25}")
+    print("-" * 75)
 
     for exp_name in ['savings_only', 'multitask']:
         if exp_name not in results:
             continue
         exp_results = results[exp_name]
-
         f1 = exp_results.get('savings_macro_f1', {})
         acc = exp_results.get('savings_accuracy', {})
-        prec = exp_results.get('savings_precision', {})
-        rec = exp_results.get('savings_recall', {})
-
         label = "Savings-only (baseline)" if exp_name == 'savings_only' else "Multi-task"
+        print(f"{label:<22} {fmt(f1):<25} {fmt(acc):<25}")
 
-        print(f"{label:<20} "
-              f"{f1.get('mean', 0):.4f}±{f1.get('std', 0):.4f}   "
-              f"{acc.get('mean', 0):.4f}±{acc.get('std', 0):.4f}   "
-              f"{prec.get('mean', 0):.4f}±{prec.get('std', 0):.4f}   "
-              f"{rec.get('mean', 0):.4f}±{rec.get('std', 0):.4f}")
-
-    print("=" * 80)
+    print("=" * 75)
 
 
 def run_multitask_experiment(config_path, dataset_path=None, output_dir=None):

@@ -835,6 +835,63 @@ Under this methodological framing, **success is not defined by high predictive a
 - Dataset fingerprinting ensures correct data version
 - Full experiment provenance (config, data hash, random state)
 
+### Leakage Detection System
+
+The pipeline includes a comprehensive **automatic leakage detection system** that runs before every experiment. This catches the most common causes of unrealistic performance (R² ≈ 1, MAE ~ 1e-10).
+
+#### Checks performed:
+
+1. **Perfect Baseline Detection** (`check_perfect_baseline`)
+   - Flags if R² > 0.999 or relative MAE < 1e-6
+   - Symptom: "Baseline has perfect performance before any augmentation"
+   - Cause: Usually target column or its components leaked into features
+
+2. **Feature Identical to Target** (`check_feature_identical_to_target`)
+   - Scans all features for exact match with target
+   - Instant detection of direct leakage
+
+3. **Trivial Target Recovery** (`check_trivial_target_recovery`)
+   - Tests if a depth-1 decision tree on any single feature achieves R² > 0.99
+   - Catches near-linear relationships that indicate derived features
+
+4. **Duplicate Rows Across Folds** (`check_duplicate_rows_across_folds`)
+   - Hashes train/val rows to detect overlap
+   - Catches improper splitting or entity leakage
+
+5. **Shuffled-Y Sanity Test** (`check_shuffled_y_sanity`)
+   - Permutes labels and retrains model
+   - If shuffled performance doesn't collapse → leakage confirmed
+   - Regression: shuffled MAE should be 50%+ worse than real
+   - Classification: shuffled F1 should be near random baseline
+
+#### Interpreting results:
+
+```
+=== LEAKAGE SANITY CHECKS ===
+  [CRITICAL] LEAKAGE DETECTED!
+    - perfect_baseline: LEAKAGE SUSPECTED: R²=0.999999, MAE=2.44e-10
+    
+  === PERFECT BASELINE DIAGNOSTIC ===
+  R² = 0.999999 (suspicious if > 0.999)
+  MAE = 2.44e-10
+  Relative MAE = 4.26e-10 (suspicious if < 1e-6)
+  
+  POSSIBLE CAUSES:
+    1. Target column (or formula components) is in features
+    2. Scaler/PCA fitted on full data before CV split
+    3. Duplicate rows between train/val
+    4. Target is trivially recoverable from a single feature
+```
+
+#### Common fixes:
+
+| Issue | Fix |
+|-------|-----|
+| Risk_Score components in features | Add to `RISK_SCORE_COMPONENTS` exclusion list |
+| Global scaler before CV | Move `StandardScaler.fit()` inside fold loop |
+| Duplicate entities | Use `GroupKFold` with entity ID |
+| Derived feature leakage | Review feature engineering pipeline |
+
 ### What failure looks like
 
 The following outcomes indicate **methodological failure**, not valid results:

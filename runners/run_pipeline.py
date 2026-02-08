@@ -2,6 +2,13 @@
 import sys
 import os
 
+# Add runners dir to path and import startup to silence warnings
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import _startup  # noqa: F401
+except ImportError:
+    os.environ.setdefault('LOKY_MAX_CPU_COUNT', str(os.cpu_count() or 4))
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
@@ -212,10 +219,19 @@ def run_full_pipeline(
             if os.path.exists(cfg_lat):
                 out_latent = os.path.join(PIPELINE_RUN_DIR, f'latent_oversampling_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
                 import subprocess
-                cmd = [sys.executable, os.path.join(PROJECT_ROOT, 'runners', 'run_latent_sampling_experiment.py'),
+                cmd = [sys.executable, '-W', 'ignore::UserWarning',
+                       os.path.join(PROJECT_ROOT, 'runners', 'run_latent_sampling_experiment.py'),
                        '--config', cfg_lat, '--dataset', dataset_path, '--output', out_latent]
-                print(f"Running latent space oversampling: {' '.join(cmd)}")
-                result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+                print(f"Running latent space oversampling...")
+                result = subprocess.run(cmd, check=False, capture_output=True, text=True,
+                                        encoding='utf-8', errors='replace')
+
+                # Filter out loky/joblib warnings from stderr
+                stderr_filtered = '\n'.join(
+                    line for line in (result.stderr or '').split('\n')
+                    if 'loky' not in line.lower() and 'physical cores' not in line.lower()
+                    and '_count_physical_cores' not in line and 'wmic' not in line.lower()
+                )
 
                 if result.returncode == 0:
                     results['augmentation'] = out_latent
@@ -223,23 +239,32 @@ def run_full_pipeline(
                     run_dirs.append(out_latent)
                     print(f"[OK] Latent oversampling saved to: {out_latent}")
 
-                    # Determine verdict based on metrics
+                    # Read verdict from metrics.json (includes quality gate results)
                     try:
                         import json as _json
                         metrics_path = os.path.join(out_latent, 'metrics.json')
                         if os.path.exists(metrics_path):
                             with open(metrics_path) as mf:
                                 metrics = _json.load(mf)
+                            # Use verdict from runner if available, otherwise compute
+                            verdict = metrics.get('verdict', 'unknown')
+                            verdict_detail = metrics.get('verdict_detail', '')
                             synth_used = metrics.get('folds_using_synth', 0)
                             total_folds = metrics.get('total_folds', 1)
-                            verdict = 'useful' if synth_used > total_folds * 0.5 else 'not_useful'
-                            print(f"    Verdict: {verdict} ({synth_used}/{total_folds} folds used synthetic)")
+
+                            if verdict == 'not_useful':
+                                print(f"    [FAIL] Verdict: {verdict} - Quality gates FAILED")
+                                print(f"    Synthetic data NOT recommended for use")
+                            elif verdict == 'partial':
+                                print(f"    [WARN] Verdict: {verdict} ({synth_used}/{total_folds} folds passed)")
+                            else:
+                                print(f"    Verdict: {verdict} ({synth_used}/{total_folds} folds used synthetic)")
                     except Exception:
                         pass
                 else:
                     print(f"[WARN] Latent oversampling failed (rc={result.returncode})")
-                    if result.stderr:
-                        print(f"    Error: {result.stderr[:500]}")
+                    if stderr_filtered.strip():
+                        print(f"    Error: {stderr_filtered[:500]}")
             else:
                 print("[WARN] No latent config found; skipping latent oversampling")
                 print(f"    Expected: {latent_cfg} or {latent_test_cfg}")
@@ -276,29 +301,68 @@ def run_full_pipeline(
     # STEP 4: Domain Transfer (Sprint 5)
     if not skip_transfer:
         print_step(4, "DOMAIN TRANSFER (Sprint 5)")
-        gmsc = "data/gmsc/GiveMeSomeCredit-training.csv"
-        if os.path.exists(gmsc):
+
+        # Search for GMSC file in multiple locations
+        gmsc_candidates = [
+            "data/gmsc/GiveMeSomeCredit-training.csv",
+            "data/gmsc/cs-training.csv",
+            os.path.join(PROJECT_ROOT, "data", "gmsc", "GiveMeSomeCredit-training.csv"),
+            os.path.join(PROJECT_ROOT, "data", "gmsc", "cs-training.csv"),
+        ]
+        gmsc = None
+        for candidate in gmsc_candidates:
+            if os.path.exists(candidate):
+                gmsc = candidate
+                print(f"  Found GMSC: {gmsc}")
+                break
+
+        if gmsc:
             try:
                 from runners.run_domain_transfer_experiment import run_domain_transfer_experiment
                 cfg = "configs/transfer/domain_transfer.yaml"
                 if test_mode and os.path.exists("configs/transfer/test_domain_transfer.yaml"):
                     cfg = "configs/transfer/test_domain_transfer.yaml"
+
                 if os.path.exists(cfg):
                     print(f"  Using config: {cfg}")
                     print(f"  ADV dataset: {dataset_path}")
                     print(f"  GMSC dataset: {gmsc}")
-                    run_dir, verdict, _ = run_domain_transfer_experiment(cfg, dataset_path, gmsc, output_dir=PIPELINE_RUN_DIR)
-                    results['domain_transfer'] = run_dir
-                    run_dirs.append(run_dir)
-                    print(f"[OK] {run_dir} - {verdict}")
+
+                    result = run_domain_transfer_experiment(cfg, dataset_path, gmsc, output_dir=PIPELINE_RUN_DIR)
+
+                    # Handle different return types robustly
+                    if result is None:
+                        print("[WARN] Domain transfer returned None")
+                    elif isinstance(result, tuple) and len(result) >= 2:
+                        run_dir, verdict = result[0], result[1]
+                        if run_dir and os.path.isdir(run_dir):
+                            results['domain_transfer'] = run_dir
+                            run_dirs.append(run_dir)
+                            print(f"[OK] {run_dir}")
+                            print(f"    Verdict: {verdict}")
+                        else:
+                            print(f"[WARN] Domain transfer dir invalid or doesn't exist: {run_dir}")
+                    elif isinstance(result, str) and os.path.isdir(result):
+                        results['domain_transfer'] = result
+                        run_dirs.append(result)
+                        print(f"[OK] {result}")
+                    else:
+                        print(f"[WARN] Domain transfer unexpected result type: {type(result)}")
                 else:
                     print(f"[WARN] Config not found: {cfg}")
+                    # List available configs for debugging
+                    cfg_dir = os.path.join(PROJECT_ROOT, "configs", "transfer")
+                    if os.path.exists(cfg_dir):
+                        print(f"  Available configs: {os.listdir(cfg_dir)}")
             except Exception as e:
                 import traceback
                 print(f"[WARN] Domain transfer error: {e}")
                 traceback.print_exc()
         else:
-            print("[WARN] GMSC not found")
+            print("[WARN] GMSC dataset not found. Searched:")
+            for c in gmsc_candidates:
+                print(f"    - {c}")
+            print("  Download from: https://www.kaggle.com/c/GiveMeSomeCredit/data")
     else:
         print_step(4, "DOMAIN TRANSFER (SKIP)")
 
@@ -331,7 +395,8 @@ def run_full_pipeline(
         try:
             import subprocess
             r = subprocess.run([sys.executable, "-m", "pytest", "tests/", "-q", "--tb=no"],
-                             capture_output=True, text=True, timeout=120, cwd=PROJECT_ROOT)
+                             capture_output=True, text=True, timeout=120, cwd=PROJECT_ROOT,
+                             encoding='utf-8', errors='replace')
             results['tests'] = "PASSED" if r.returncode == 0 else f"FAILED (rc={r.returncode})"
             # Save pytest output for debugging
             try:

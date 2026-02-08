@@ -227,11 +227,12 @@ class LatentExperimentPlotter:
     # 2) LATENT SPACE VISUALIZATION
     # -------------------------------------------------------------------------
 
-    def plot_latent_scatter(self, Z: np.ndarray, labels: np.ndarray, centroids: np.ndarray = None,
-                           title: str = 'Latent Space Clusters'):
+    def plot_latent_scatter(self, Z: np.ndarray, labels: np.ndarray = None, centroids: np.ndarray = None,
+                           title: str = 'Latent Space'):
         """
         2D scatter plot of latent space colored by cluster.
         If Z has more than 2 dimensions, uses first 2 PCs.
+        If labels is None, shows all points in single color (continuous latent space).
         """
         if Z.shape[1] > 2:
             pca_2d = PCA(n_components=2, random_state=self.random_state)
@@ -245,14 +246,19 @@ class LatentExperimentPlotter:
 
         plt.figure(figsize=(8, 6))
 
-        unique_labels = np.unique(labels)
-        cmap = plt.get_cmap('tab10')
-        colors = [cmap(i / max(1, len(unique_labels) - 1)) for i in range(len(unique_labels))]
+        if labels is None:
+            # No clustering - show as continuous cloud
+            plt.scatter(Z_2d[:, 0], Z_2d[:, 1], c='steelblue', alpha=0.5, s=30,
+                       label=f'Samples (n={len(Z_2d)})')
+        else:
+            unique_labels = np.unique(labels)
+            cmap = plt.get_cmap('tab10')
+            colors = [cmap(i / max(1, len(unique_labels) - 1)) for i in range(len(unique_labels))]
 
-        for i, label in enumerate(unique_labels):
-            mask = labels == label
-            plt.scatter(Z_2d[mask, 0], Z_2d[mask, 1], c=[colors[i]],
-                       label=f'Cluster {label} (n={mask.sum()})', alpha=0.6, s=30)
+            for i, label in enumerate(unique_labels):
+                mask = labels == label
+                plt.scatter(Z_2d[mask, 0], Z_2d[mask, 1], c=[colors[i]],
+                           label=f'Cluster {label} (n={mask.sum()})', alpha=0.6, s=30)
 
         if centroids_2d is not None:
             plt.scatter(centroids_2d[:, 0], centroids_2d[:, 1], c='black',
@@ -796,9 +802,10 @@ class LatentExperimentPlotter:
         plt.close()
 
     def plot_latent_with_synthetic(self, Z_real: np.ndarray, Z_synth: np.ndarray,
-                                    labels_real: np.ndarray):
+                                    labels_real: np.ndarray = None):
         """
         Scatter plot showing real vs synthetic points in latent space.
+        If labels_real is None, shows all real points in single color (continuous sampler).
         """
         if Z_synth is None or Z_synth.shape[0] == 0:
             return
@@ -814,16 +821,21 @@ class LatentExperimentPlotter:
 
         plt.figure(figsize=(8, 6))
 
-        # Plot real by cluster
-        unique_labels = np.unique(labels_real)
-        for label in unique_labels:
-            mask = labels_real == label
-            plt.scatter(Z_real_2d[mask, 0], Z_real_2d[mask, 1],
-                       c=f'C{label}', alpha=0.4, s=20, label=f'Real cluster {label}')
+        if labels_real is None:
+            # No clustering - show real points in single color
+            plt.scatter(Z_real_2d[:, 0], Z_real_2d[:, 1],
+                       c='steelblue', alpha=0.4, s=20, label=f'Real (n={len(Z_real_2d)})')
+        else:
+            # Plot real by cluster
+            unique_labels = np.unique(labels_real)
+            for label in unique_labels:
+                mask = labels_real == label
+                plt.scatter(Z_real_2d[mask, 0], Z_real_2d[mask, 1],
+                           c=f'C{label}', alpha=0.4, s=20, label=f'Real cluster {label}')
 
         # Plot synthetic
         plt.scatter(Z_synth_2d[:, 0], Z_synth_2d[:, 1],
-                   c='red', marker='x', s=30, alpha=0.8, label='Synthetic')
+                   c='red', marker='x', s=30, alpha=0.8, label=f'Synthetic (n={len(Z_synth_2d)})')
 
         plt.xlabel('PC1')
         plt.ylabel('PC2')
