@@ -15,6 +15,7 @@ def test_run_creates_required_artifacts(
     assert os.path.isfile(os.path.join(run_dir, "metrics.json"))
     assert os.path.isfile(os.path.join(run_dir, "model.joblib"))
     assert os.path.isfile(os.path.join(run_dir, "data_profile.json"))  # New: dataset fingerprint
+    assert os.path.isfile(os.path.join(run_dir, "leakage_audit.json"))
 
     with open(os.path.join(run_dir, "metrics.json"), "r") as f:
         metrics = json.load(f)
@@ -76,4 +77,34 @@ def test_metrics_include_fold_level_scores(
         assert "all" in metrics["cv_results"][metric]
         assert isinstance(metrics["cv_results"][metric]["all"], list)
         assert len(metrics["cv_results"][metric]["all"]) > 0
+
+
+def test_leakage_audit_passes_for_regression_fixture(
+    base_regression_config, write_yaml, patch_dataset_loader
+):
+    cfg_path = write_yaml(base_regression_config, "leakage_audit.yaml")
+    run_dir = run_baseline.run_baseline(cfg_path, dataset_path="IGNORED.csv")
+
+    with open(os.path.join(run_dir, "leakage_audit.json"), "r") as f:
+        audit = json.load(f)
+
+    assert audit["overall"]["is_valid"] is True
+    assert "preprocessing_train_only_fit" in audit["checks"]
+    assert "duplicate_audit" in audit["checks"]
+    assert "risk_score_shuffle_sanity" in audit["checks"]
+
+
+def test_leakage_audit_includes_savings_sanity_checks(
+    base_classification_config, write_yaml, patch_dataset_loader
+):
+    cfg_path = write_yaml(base_classification_config, "leakage_audit_clf.yaml")
+    run_dir = run_baseline.run_baseline(cfg_path, dataset_path="IGNORED.csv")
+
+    with open(os.path.join(run_dir, "leakage_audit.json"), "r") as f:
+        audit = json.load(f)
+
+    assert audit["overall"]["is_valid"] is True
+    assert "savings_perfect_baseline_guard" in audit["checks"]
+    assert "savings_shuffle_sanity" in audit["checks"]
+
 

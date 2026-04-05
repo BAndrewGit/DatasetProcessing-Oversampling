@@ -163,3 +163,49 @@ def test_multitask_training_runs():
     # Check model is returned
     assert model is not None
 
+
+def test_multitask_dynamic_weighting_updates_task_weights():
+    """Dynamic weighting should adapt risk/savings loss weights when enabled."""
+    np.random.seed(7)
+    n_samples = 32
+    n_features = 8
+
+    X_train = np.random.randn(n_samples, n_features).astype(np.float32)
+    y_risk_train = np.random.rand(n_samples).astype(np.float32)
+    y_savings_train = np.random.randint(0, 2, n_samples).astype(np.float32)
+
+    X_val = np.random.randn(16, n_features).astype(np.float32)
+    y_risk_val = np.random.rand(16).astype(np.float32)
+    y_savings_val = np.random.randint(0, 2, 16).astype(np.float32)
+
+    config = {
+        'hidden_dims': [16, 8],
+        'dropout': 0.2,
+        'lr': 0.005,
+        'weight_decay': 0.001,
+        'batch_size': 8,
+        'max_epochs': 6,
+        'patience': 3,
+        'risk_loss': 'huber',
+        'clip_grad': 1.0,
+        'risk_weight': 1.0,
+        'savings_weight': 1.0,
+        'use_pcgrad': True,
+        'log_gradients': True,
+        'dynamic_weighting': True,
+        'target_grad_ratio': 1.0,
+        'weight_update_rate': 0.2,
+    }
+
+    metrics, _ = train_multitask(
+        X_train, y_risk_train, y_savings_train,
+        X_val, y_risk_val, y_savings_val,
+        config, seed=99
+    )
+
+    grad_logs = metrics.get('_gradient_logs', [])
+    assert len(grad_logs) > 0
+    # At least one log entry should include task weights from dynamic rebalancing.
+    assert all('risk_weight' in g and 'savings_weight' in g for g in grad_logs)
+
+

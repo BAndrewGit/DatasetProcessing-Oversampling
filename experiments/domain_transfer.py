@@ -1125,6 +1125,55 @@ def train_with_gmsc_transfer(
     return metrics, trainer.model
 
 
+def train_hybrid_multitask_transfer(
+    adv_X_train: np.ndarray, adv_y_risk_train: np.ndarray, adv_y_savings_train: np.ndarray,
+    adv_X_val: np.ndarray, adv_y_risk_val: np.ndarray, adv_y_savings_val: np.ndarray,
+    gmsc_X_train: np.ndarray, gmsc_y_train: np.ndarray,
+    config: Dict, seed: int,
+) -> Tuple[Dict, nn.Module]:
+    """
+    Hybrid production strategy: multitask backbone + controlled transfer regularization.
+
+    Design constraints:
+    - Survey warmup first (ADV-only epochs)
+    - Small GMSC auxiliary weight (cannot dominate primary risk/savings tasks)
+    - Alignment starts late and ramps gradually
+    - Trunk freeze/unfreeze is explicit and short
+    """
+    hybrid_cfg = dict(config)
+
+    # Hard guards for controlled auxiliary transfer.
+    hybrid_cfg['gmsc_risk_weight'] = min(float(config.get('gmsc_risk_weight', 0.03)), 0.05)
+    hybrid_cfg['warmup_epochs'] = max(int(config.get('warmup_epochs', 8)), 5)
+    hybrid_cfg['freeze_trunk_epochs'] = max(int(config.get('freeze_trunk_epochs', 3)), 1)
+
+    # Alignment is optional but delayed by default.
+    hybrid_cfg['alignment_enabled'] = bool(config.get('alignment_enabled', True))
+    hybrid_cfg['alignment_start_epoch'] = max(int(config.get('alignment_start_epoch', 15)), hybrid_cfg['warmup_epochs'])
+    hybrid_cfg['alignment_weight'] = min(float(config.get('alignment_weight', 0.02)), 0.05)
+    hybrid_cfg['alignment_max_weight'] = min(float(config.get('alignment_max_weight', 0.08)), 0.1)
+
+    # Keep ADV heads as primary objective.
+    hybrid_cfg['adv_risk_weight'] = float(config.get('adv_risk_weight', 1.0))
+    hybrid_cfg['savings_weight'] = float(config.get('savings_weight', 1.0))
+
+    metrics, model = train_with_gmsc_transfer(
+        adv_X_train=adv_X_train,
+        adv_y_risk_train=adv_y_risk_train,
+        adv_y_savings_train=adv_y_savings_train,
+        adv_X_val=adv_X_val,
+        adv_y_risk_val=adv_y_risk_val,
+        adv_y_savings_val=adv_y_savings_val,
+        gmsc_X_train=gmsc_X_train,
+        gmsc_y_train=gmsc_y_train,
+        config=hybrid_cfg,
+        seed=seed,
+        ablation_mode='full',
+    )
+    metrics['_hybrid_config'] = hybrid_cfg
+    return metrics, model
+
+
 # =============================================================================
 # UPGRADE #2: RISK BINNING (Convert regression to ordinal classification)
 # =============================================================================

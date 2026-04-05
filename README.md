@@ -210,7 +210,7 @@ Procesare Dataset/
 ├── runners/                    # Experiment execution scripts
 │   ├── run_pipeline.py         # Full pipeline runner (recommended)
 │   ├── run_baseline.py         # Baseline experiments (no augmentation)
-│   ├── run_latent_sampling_experiment.py  # Latent space oversampling
+│   ├── run_latent_sampling_experiment.py  # [REJECTED EXPERIMENT] archived latent oversampling
 │   ├── run_multitask_experiment.py    # Multi-task learning
 │   ├── run_domain_transfer_experiment.py  # Domain transfer (ADV+GMSC)
 │   ├── run_analysis.py         # Interpretability and paper artifacts
@@ -328,19 +328,20 @@ Each experiment creates a folder in `runs/` containing:
 | `model_metadata.json`     | Model artifacts metadata                       |
 | `cv_distribution.png`     | CV score distributions                         |
 
-### Additional files for latent oversampling runs:
+### Inference bundle (production export)
 
-| File                        | Description                                   |
-|-----------------------------|-----------------------------------------------|
-| `oversampled_dataset.csv`   | Full dataset with `is_synthetic` column       |
-| `augmented_data.csv`        | Clean augmented dataset (ready to use)        |
-| `pca.joblib`                | Fitted PCA model                              |
-| `kmeans.joblib`             | Fitted KMeans clusterer                       |
-| `pca_selection.json`        | PCA K selection details and EVR               |
-| `cluster_report.json`       | Clustering results (silhouette, DBI, sizes)   |
-| `synthetic_audit.json`      | Quality gate results                          |
-| `latent_cluster_scatter.png`| 2D cluster visualization                      |
-| `pca_evr.png`               | Explained variance ratio plot                 |
+| File | Description |
+|------|-------------|
+| `model.pt` | Frozen PyTorch weights for selected final model |
+| `scaler.pkl` | Fitted scaler used at inference time |
+| `feature_columns.json` | Exact feature order expected by model |
+| `bank_mapping_rules.yaml` | Rule-engine thresholds for alert messages |
+| `thresholds.json` | Decision thresholds (`saving_probability_threshold`, etc.) |
+| `model_metadata.json` | Model family, architecture config, provenance |
+
+Inference API is available in `experiments/inference_hybrid.py`:
+- `predict(features)` -> `risk_score`, `saving_probability`, `top_factors`, `alerts`, `confidence`
+- `explain(features)` -> explanation-focused output for UI
 
 ---
 
@@ -370,11 +371,14 @@ python runners/run_pipeline.py --data data/processed/1_encoded.csv
 
 The pipeline automatically runs:
 1. **Baseline experiments** (regression + classification)
-2. **Latent Space Oversampling** (PCA + clustering synthetic generation)
-3. **Multi-task ablation** (shared trunk experiment)
-4. **Domain transfer** (ADV + GMSC)
+2. **Multi-task ablation** (shared trunk experiment)
+3. **Domain transfer** (ADV + GMSC)
+4. **Hybrid multitask+transfer selection + export**
 5. **Comprehensive analysis**
-6. **Test suite**
+6. **Leakage audit checks** (train-only fit, duplicate audit, shuffle sanity)
+7. **Test suite**
+
+> Latent oversampling is **explicitly retired** from the final pipeline and treated as a rejected experiment.
 
 ### 1. Baseline experiments (single-task)
 
@@ -386,9 +390,9 @@ python runners/run_baseline.py --config configs/baseline/regression.yaml
 python runners/run_baseline.py --config configs/baseline/classification.yaml
 ```
 
-### 2. Latent Space Oversampling (NEW - Replaces old SMOTE/jitter)
+### 2. Latent oversampling (Rejected experiment - archived)
 
-The primary method for synthetic data generation now uses **PCA latent space + clustering**:
+This experiment is kept only for historical reproducibility and is **excluded from final training/reporting**:
 
 ```bash
 python runners/run_latent_sampling_experiment.py \
@@ -424,15 +428,52 @@ python runners/run_multitask_experiment.py --config configs/multitask/experiment
 python runners/run_domain_transfer_experiment.py --config configs/transfer/domain_transfer.yaml
 ```
 
-
-### 5. Analysis and interpretability
+### 4.5 Hybrid production bundle
 
 ```bash
-python runners/run_analysis.py \
-  --runs runs/experiment_1/ runs/experiment_2/ \
+python runners/run_hybrid_production.py \
+  --multitask-config configs/multitask/experiment.yaml \
+  --transfer-config configs/transfer/hybrid_transfer.yaml \
   --dataset data/processed/1_encoded.csv \
-  --output analysis_output/
+  --gmsc data/gmsc/GiveMeSomeCredit-training.csv \
+  --output runs/
 ```
+
+This step compares `multitask-only` vs `hybrid multitask+transfer`, keeps risk-first criteria (Spearman + MAE + stability), and exports a frozen inference bundle.
+
+### 4.6 Promote release bundle + plots
+
+```bash
+python runners/run_release_promote.py \
+  --decision-dir runs/final_decision_YYYYMMDD_HHMMSS \
+  --releases-dir deployment/releases \
+  --release-name release_v1
+```
+
+Generated release artifacts:
+- `deployment/releases/<release>/bundle/` (frozen inference bundle)
+- `deployment/releases/<release>/plots/metric_bars.png`
+- `deployment/releases/<release>/plots/fold_boxplots.png`
+- `deployment/releases/<release>/plots/selection_checks.png`
+- `deployment/releases/<release>/promotion_manifest.json`
+- `deployment/current/` updated to latest promoted release
+
+### 4.7 Verify promoted release
+
+```bash
+python runners/verify_release.py \
+  --release-dir deployment/releases/release_v1
+```
+
+Optional strict check for original source paths from manifest:
+
+```bash
+python runners/verify_release.py \
+  --release-dir deployment/releases/release_v1 \
+  --strict-sources
+```
+
+`verify_release.py` validates the release structure (`bundle/`, `decision_snapshot/`, `plots/`) and required files, then exits with code `0` on pass or `1` on failure.
 
 ---
 
@@ -464,9 +505,9 @@ Baseline runs **never** allow synthetic augmentation.
 
 ---
 
-## Running augmentation experiments (Latent Space Oversampling)
+## Rejected experiment archive: latent oversampling
 
-This mode generates synthetic data using **PCA latent space + clustering** and tests whether it improves **real-only performance**. If any quality gate fails, the pipeline automatically falls back to real-only data.
+This mode generated synthetic data using **PCA latent space + clustering**. It is now retained only as a negative/rejected experiment and is not part of the production or publication pipeline.
 
 ### How it works
 
@@ -605,12 +646,12 @@ The `data_profile.json` contains augmentation statistics:
 }
 ```
 
-### Legacy method (DEPRECATED)
+### Legacy method (DEPRECATED / archived)
 
 The old jitter/SMOTE augmentation is still available but deprecated:
 
 ```bash
-# DEPRECATED - use latent_sampling instead
+# DEPRECATED - archived only (not part of final pipeline)
 python runners/augmentation_experiment.py \
   --config configs/augmentation/experiment.yaml \
   --dataset path/to/data.csv
@@ -695,9 +736,9 @@ model:
 
 ---
 
-## Latent Space Oversampling (Primary Augmentation Method)
+## Latent Space Oversampling (Rejected Method - historical reference)
 
-This is the **primary method for synthetic data generation**, replacing the old jitter/SMOTE approaches. It generates synthetic samples in a PCA-reduced latent space using cluster-conditioned sampling.
+This section documents a **rejected method** kept for transparency. It is not part of the final model comparison and must not be used in primary training/reporting claims.
 
 ### Why Latent Space?
 

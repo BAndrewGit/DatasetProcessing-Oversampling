@@ -447,3 +447,12 @@ def test_analysis_reproducibility():
         result2['importance_mean'].values
     )
 
+
+def test_rejected_latent_run_detection():
+    """Latent/oversampling runs must be excluded from final analysis comparisons."""
+    from runners.run_analysis import _is_rejected_latent_run
+
+    assert _is_rejected_latent_run("runs/latent_oversampling_20260101") is True
+    assert _is_rejected_latent_run("runs/clean_baseline_regression_20260101") is False
+
+

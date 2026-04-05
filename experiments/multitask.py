@@ -74,7 +74,9 @@ class MultiTaskTrainer:
     def __init__(self, model, device='cpu', lr=0.001, weight_decay=0.01,
                  risk_loss_fn='huber', clip_grad=1.0, patience=10,
                  mode='multitask', risk_weight=1.0, savings_weight=1.0,
-                 use_pcgrad=False, log_gradients=False):
+                 use_pcgrad=False, log_gradients=False,
+                 dynamic_weighting=False, target_grad_ratio=1.0,
+                 weight_update_rate=0.05, min_task_weight=0.2, max_task_weight=5.0):
         self.model = model.to(device)
         self.device = device
         self.optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -95,6 +97,13 @@ class MultiTaskTrainer:
         self.log_gradients = log_gradients
         self.gradient_logs = []  # Store gradient norms per epoch
 
+        # Optional dynamic weighting to prevent savings domination.
+        self.dynamic_weighting = dynamic_weighting
+        self.target_grad_ratio = target_grad_ratio
+        self.weight_update_rate = weight_update_rate
+        self.min_task_weight = min_task_weight
+        self.max_task_weight = max_task_weight
+
         # Loss functions
         if risk_loss_fn == 'huber':
             self.risk_loss_fn = nn.HuberLoss()
@@ -106,6 +115,24 @@ class MultiTaskTrainer:
         # Threshold optimization state
         self.optimal_threshold = 0.5  # Will be updated during training
         self.threshold_history = []
+
+    def _update_task_weights(self, grad_ratio: float):
+        """Adapt task weights based on observed risk/savings trunk gradient ratio."""
+        if not self.dynamic_weighting or self.mode != 'multitask':
+            return
+
+        safe_ratio = max(float(grad_ratio), 1e-6)
+        target = max(float(self.target_grad_ratio), 1e-6)
+        # If risk gradients are too small, increase risk weight and reduce savings weight.
+        factor = target / safe_ratio
+        bounded = float(np.clip(factor, 0.8, 1.25))
+        step = self.weight_update_rate
+
+        risk_mult = 1.0 + step * (bounded - 1.0)
+        savings_mult = 1.0 + step * ((1.0 / bounded) - 1.0)
+
+        self.risk_weight = float(np.clip(self.risk_weight * risk_mult, self.min_task_weight, self.max_task_weight))
+        self.savings_weight = float(np.clip(self.savings_weight * savings_mult, self.min_task_weight, self.max_task_weight))
 
     def _compute_trunk_gradients(self, loss, task_name):
         """Compute gradient norms on shared trunk for a specific task loss."""
@@ -224,11 +251,15 @@ class MultiTaskTrainer:
 
         # Log gradient norms for this epoch
         if self.log_gradients and epoch_risk_grad_norms:
+            ratio = np.mean(epoch_risk_grad_norms) / (np.mean(epoch_savings_grad_norms) + 1e-8)
             self.gradient_logs.append({
                 'risk_grad_norm': np.mean(epoch_risk_grad_norms),
                 'savings_grad_norm': np.mean(epoch_savings_grad_norms),
-                'ratio': np.mean(epoch_risk_grad_norms) / (np.mean(epoch_savings_grad_norms) + 1e-8)
+                'ratio': ratio,
+                'risk_weight': self.risk_weight,
+                'savings_weight': self.savings_weight,
             })
+            self._update_task_weights(ratio)
 
         return total_loss / len(train_loader)
 
@@ -570,6 +601,11 @@ def train_multitask(X_train, y_risk_train, y_savings_train,
     savings_weight = config.get('savings_weight', 1.0)
     use_pcgrad = config.get('use_pcgrad', False)
     log_gradients = config.get('log_gradients', True)  # Enable by default for debugging
+    dynamic_weighting = config.get('dynamic_weighting', False)
+    target_grad_ratio = config.get('target_grad_ratio', 1.0)
+    weight_update_rate = config.get('weight_update_rate', 0.05)
+    min_task_weight = config.get('min_task_weight', 0.2)
+    max_task_weight = config.get('max_task_weight', 5.0)
 
     # Train with mode='multitask' for joint optimization
     trainer = MultiTaskTrainer(
@@ -583,7 +619,12 @@ def train_multitask(X_train, y_risk_train, y_savings_train,
         risk_weight=risk_weight,
         savings_weight=savings_weight,
         use_pcgrad=use_pcgrad,
-        log_gradients=log_gradients
+        log_gradients=log_gradients,
+        dynamic_weighting=dynamic_weighting,
+        target_grad_ratio=target_grad_ratio,
+        weight_update_rate=weight_update_rate,
+        min_task_weight=min_task_weight,
+        max_task_weight=max_task_weight,
     )
 
     metrics = trainer.fit(train_loader, val_loader, max_epochs=config.get('max_epochs', 100))

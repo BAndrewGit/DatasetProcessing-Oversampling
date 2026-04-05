@@ -51,7 +51,6 @@ from analysis.paper_artifacts import (
     generate_ablation_table,
     create_methodology_diagram,
     create_results_summary,
-    package_latent_sprint_artifacts
 )
 
 
@@ -339,6 +338,13 @@ def package_latent_runs_into_analysis(experiment_results: Dict[str, Dict], analy
             print(f"Packaged latent sprint artifacts for {exp_name} -> {out_dir}")
         except Exception as e:
             print(f"Failed to package latent artifacts for {exp_name}: {e}")
+
+
+def _is_rejected_latent_run(run_dir: str) -> bool:
+    """Detect latent/oversampling runs that must be excluded from final reporting."""
+    name = os.path.basename(run_dir).lower()
+    blocked_tokens = ['latent', 'oversampling', 'augmentation_experiment']
+    return any(token in name for token in blocked_tokens)
 
 def run_stability_analysis(
     experiment_results: Dict[str, Dict],
@@ -778,9 +784,18 @@ def run_full_analysis(
     print(f"Analyzing {len(run_dirs)} experiment(s)")
     print("=" * 70)
 
-    # Load all experiment results
+    # Load all experiment results (excluding rejected latent/oversampling runs)
     all_experiments = {}
+    rejected_experiments = []
     for run_dir in run_dirs:
+        if _is_rejected_latent_run(run_dir):
+            rejected_experiments.append({
+                'run_dir': run_dir,
+                'status': 'rejected',
+                'reason': 'Latent oversampling is retired and excluded from final comparison.',
+            })
+            print(f"Skipped rejected experiment: {os.path.basename(run_dir)}")
+            continue
         exp_name = os.path.basename(run_dir)
         results = load_experiment_results(run_dir)
         if results:
@@ -840,12 +855,6 @@ def run_full_analysis(
     target_col = config.get('data', {}).get('target_column', 'Risk_Score')
     target_type = config.get('data', {}).get('target_type', 'regression')
 
-    # Package any latent-sprint artifacts (Sprint 7) into analysis dir now that we know target_type
-    try:
-        package_latent_runs_into_analysis(all_experiments, os.path.join(analysis_dir, 'latent_sprint'), task=target_type)
-    except Exception as e:
-        print(f"[WARN] Packaging latent sprint artifacts failed: {e}")
-
     # Try to get features from first experiment's data_profile
     first_exp = list(all_experiments.values())[0]
     data_profile = first_exp.get('data_profile', {})
@@ -885,7 +894,8 @@ def run_full_analysis(
             'n_samples': len(X),
             'n_features': len(feature_cols),
             'target': target_col,
-            'experiments': list(all_experiments.keys())
+            'experiments': list(all_experiments.keys()),
+            'rejected_experiments': rejected_experiments,
         },
         'experiments': {},
         'interpretability': {},

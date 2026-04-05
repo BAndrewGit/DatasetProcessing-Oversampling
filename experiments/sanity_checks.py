@@ -2,6 +2,7 @@
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import KFold
+from sklearn.model_selection import RepeatedKFold, RepeatedStratifiedKFold
 from sklearn.metrics import f1_score, silhouette_score
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
@@ -539,6 +540,93 @@ def validate_preprocessing_no_leakage(X_train: np.ndarray, X_val: np.ndarray,
     return {
         'issues': issues,
         'is_valid': len(issues) == 0
+    }
+
+
+def run_minimal_leakage_audit(X, y, config: dict, model_fn, seed: int = 42) -> dict:
+    """
+    Run the minimum mandatory anti-leakage audit before training.
+
+    Audit scope:
+    - Transformations are fit on train fold only
+    - Duplicate rows across train/validation
+    - Shuffled-label negative control for Risk_Score
+    - Savings sanity checks for suspiciously high small-data scores
+    """
+    X_np = X.values if hasattr(X, 'values') else np.asarray(X)
+    y_np = y.values if hasattr(y, 'values') else np.asarray(y)
+
+    target = config.get('data', {}).get('target_column', '')
+    target_type = config.get('data', {}).get('target_type', 'regression')
+    cv_cfg = config.get('cross_validation', {})
+    n_splits = int(cv_cfg.get('n_splits', 5))
+    n_repeats = int(cv_cfg.get('n_repeats', 1))
+
+    if target_type == 'classification':
+        splitter = RepeatedStratifiedKFold(
+            n_splits=n_splits,
+            n_repeats=max(1, n_repeats),
+            random_state=seed,
+        )
+        split_iter = splitter.split(X_np, y_np)
+    else:
+        splitter = RepeatedKFold(
+            n_splits=n_splits,
+            n_repeats=max(1, n_repeats),
+            random_state=seed,
+        )
+        split_iter = splitter.split(X_np)
+
+    train_idx, val_idx = next(split_iter)
+    X_train = X_np[train_idx]
+    X_val = X_np[val_idx]
+
+    # Explicit train-only fit check for transforms.
+    scaler = StandardScaler()
+    scaler.fit(X_train)
+    preprocessing_check = validate_preprocessing_no_leakage(X_train, X_val, scaler=scaler)
+
+    duplicate_check = check_duplicate_rows_across_folds(X_np, y_np, train_idx, val_idx)
+
+    checks = {
+        'preprocessing_train_only_fit': preprocessing_check,
+        'duplicate_audit': duplicate_check,
+        'behavior_risk_level_forbidden': {
+            'is_valid': 'Behavior_Risk_Level' not in list(getattr(X, 'columns', [])),
+            'severity': 'OK' if 'Behavior_Risk_Level' not in list(getattr(X, 'columns', [])) else 'CRITICAL',
+        },
+    }
+
+    if target == 'Risk_Score' and target_type == 'regression':
+        checks['risk_score_shuffle_sanity'] = check_shuffled_y_sanity(
+            X_np, y_np, model_fn=model_fn, task='regression', n_repeats=3, seed=seed
+        )
+
+    if target == 'Save_Money_Yes' and target_type == 'classification':
+        checks['savings_perfect_baseline_guard'] = check_perfect_baseline(
+            X_np, y_np, train_idx, val_idx, task='classification', seed=seed
+        )
+        checks['savings_shuffle_sanity'] = check_shuffled_y_sanity(
+            X_np, y_np, model_fn=model_fn, task='classification', n_repeats=3, seed=seed
+        )
+
+    def _is_valid(result: dict) -> bool:
+        if not isinstance(result, dict):
+            return True
+        if result.get('severity') == 'SKIPPED':
+            return True
+        return bool(result.get('is_valid', True))
+
+    failed = [name for name, result in checks.items() if not _is_valid(result)]
+
+    return {
+        'checks': checks,
+        'failed_checks': failed,
+        'overall': {
+            'is_valid': len(failed) == 0,
+            'severity': 'OK' if len(failed) == 0 else 'CRITICAL',
+            'message': 'Leakage audit passed' if len(failed) == 0 else f'Leakage audit failed: {failed}',
+        },
     }
 
 

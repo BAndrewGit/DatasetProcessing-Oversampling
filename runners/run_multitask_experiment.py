@@ -148,11 +148,11 @@ def preprocess_multitask_data(df, config):
     return X, y_risk, y_savings
 
 
-def run_multitask_cv(X, y_risk, y_savings, config):
+def run_multitask_cv(X, y_risk, y_savings, config, multitask_only=False):
     """
     Run repeated K-fold CV for all three ablation experiments:
-    1. Risk-only
-    2. Savings-only
+    1. Risk-only (optional)
+    2. Savings-only (optional)
     3. Multi-task
 
     FIX 3: Uses RepeatedStratifiedKFold to handle imbalanced classification.
@@ -208,22 +208,23 @@ def run_multitask_cv(X, y_risk, y_savings, config):
         y_risk_train, y_risk_val = y_risk.iloc[train_idx].values, y_risk.iloc[val_idx].values
         y_savings_train, y_savings_val = y_savings.iloc[train_idx].values, y_savings.iloc[val_idx].values
 
-        # Risk-only
-        risk_metrics, risk_model = train_single_task_risk(
-            X_train, y_risk_train, X_val, y_risk_val,
-            config['model'], seed + fold_idx
-        )
-        # Filter out internal keys starting with '_'
-        risk_only_metrics.append({k: v for k, v in risk_metrics.items() if not k.startswith('_')})
-        saved_models['risk_only'] = risk_model
+        if not multitask_only:
+            # Risk-only
+            risk_metrics, risk_model = train_single_task_risk(
+                X_train, y_risk_train, X_val, y_risk_val,
+                config['model'], seed + fold_idx
+            )
+            # Filter out internal keys starting with '_'
+            risk_only_metrics.append({k: v for k, v in risk_metrics.items() if not k.startswith('_')})
+            saved_models['risk_only'] = risk_model
 
-        # Savings-only
-        savings_metrics, savings_model = train_single_task_savings(
-            X_train, y_savings_train, X_val, y_savings_val,
-            config['model'], seed + fold_idx
-        )
-        savings_only_metrics.append({k: v for k, v in savings_metrics.items() if not k.startswith('_')})
-        saved_models['savings_only'] = savings_model
+            # Savings-only
+            savings_metrics, savings_model = train_single_task_savings(
+                X_train, y_savings_train, X_val, y_savings_val,
+                config['model'], seed + fold_idx
+            )
+            savings_only_metrics.append({k: v for k, v in savings_metrics.items() if not k.startswith('_')})
+            saved_models['savings_only'] = savings_model
 
         # Multi-task
         mt_metrics, mt_model = train_multitask(
@@ -246,10 +247,11 @@ def run_multitask_cv(X, y_risk, y_savings, config):
 
     # Aggregate results
     results = {
-        'risk_only': _aggregate_metrics(risk_only_metrics),
-        'savings_only': _aggregate_metrics(savings_only_metrics),
         'multitask': _aggregate_metrics(multitask_metrics)
     }
+    if not multitask_only:
+        results['risk_only'] = _aggregate_metrics(risk_only_metrics)
+        results['savings_only'] = _aggregate_metrics(savings_only_metrics)
 
     # Add gradient logs and threshold info for plotting
     if all_gradient_logs:
@@ -339,7 +341,7 @@ def print_results(results):
     print("=" * 75)
 
 
-def run_multitask_experiment(config_path, dataset_path=None, output_dir=None):
+def run_multitask_experiment(config_path, dataset_path=None, output_dir=None, multitask_only=False):
     """
     Run multi-task learning ablation experiment.
     """
@@ -366,9 +368,12 @@ def run_multitask_experiment(config_path, dataset_path=None, output_dir=None):
     print(f"Seed: {seed}")
     print("=" * 80)
     print("Ablation design:")
-    print("  1. Risk-only model (baseline)")
-    print("  2. Savings-only model (baseline)")
-    print("  3. Multi-task model (shared trunk + both heads)")
+    if multitask_only:
+        print("  1. Multi-task only mode (final production comparison)")
+    else:
+        print("  1. Risk-only model (baseline)")
+        print("  2. Savings-only model (baseline)")
+        print("  3. Multi-task model (shared trunk + both heads)")
     print("=" * 80)
 
     # Load data
@@ -381,7 +386,7 @@ def run_multitask_experiment(config_path, dataset_path=None, output_dir=None):
     X, y_risk, y_savings = preprocess_multitask_data(df, config)
 
     # Run CV ablation
-    results, saved_models = run_multitask_cv(X, y_risk, y_savings, config)
+    results, saved_models = run_multitask_cv(X, y_risk, y_savings, config, multitask_only=multitask_only)
 
     # Print results
     print_results(results)

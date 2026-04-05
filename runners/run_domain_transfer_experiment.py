@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import RepeatedKFold
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score
 
 from experiments.io import load_config
 from experiments.config_schema import FORBIDDEN_TARGETS
@@ -30,6 +31,7 @@ from experiments.data import RISK_SCORE_COMPONENTS  # Bug #5 FIX: Import leakage
 from experiments.domain_transfer import (
     train_adv_only,
     train_with_gmsc_transfer,
+    train_hybrid_multitask_transfer,
     train_pretrain_finetune,
     train_with_optimized_mixture,
     train_with_all_upgrades,
@@ -239,19 +241,21 @@ def load_gmsc_data(config: dict, dataset_path: str = None) -> tuple:
 def run_domain_transfer_cv(
     adv_X: np.ndarray, adv_y_risk: np.ndarray, adv_y_savings: np.ndarray,
     gmsc_X: np.ndarray, gmsc_y: np.ndarray,
-    config: dict, seed: int
+    config: dict, seed: int,
+    include_adv_only: bool = True,
 ) -> dict:
     """
     Run repeated K-fold CV for domain transfer ablation.
 
     Compares:
-    1. ADV-only training (baseline)
+    1. ADV-only training (baseline, optional)
     2. ADV + GMSC transfer (selected strategy from config)
 
     Training strategies:
     - 'joint': Original joint training
     - 'pretrain_finetune': Pretrain on GMSC, then fine-tune on ADV (recommended)
     - 'optimized_mixture': ADV-dominant with subsampled GMSC
+    - 'hybrid': multitask backbone + low-weight transfer regularization (production)
 
     Evaluation on ADV data only.
     """
@@ -316,23 +320,32 @@ def run_domain_transfer_cv(
 
         fold_seed = seed + fold_idx
 
-        # Experiment 1: ADV-only
-        print("  Training ADV-only model...")
-        adv_metrics, adv_model = train_adv_only(
-            adv_X_train_s, adv_y_risk_train, adv_y_savings_train,
-            adv_X_val_s, adv_y_risk_val, adv_y_savings_val,
-            model_config, fold_seed
-        )
-        adv_only_metrics.append(adv_metrics)
-        saved_models['adv_only_models'].append(adv_model)
-        # save scalers for this fold
+        # Save scalers for this fold (needed for export regardless of comparison mode)
         saved_models['adv_scalers'].append(adv_scaler)
         saved_models['gmsc_scalers'].append(gmsc_scaler)
+
+        # Experiment 1: ADV-only (optional)
+        if include_adv_only:
+            print("  Training ADV-only model...")
+            adv_metrics, adv_model = train_adv_only(
+                adv_X_train_s, adv_y_risk_train, adv_y_savings_train,
+                adv_X_val_s, adv_y_risk_val, adv_y_savings_val,
+                model_config, fold_seed
+            )
+            adv_only_metrics.append(adv_metrics)
+            saved_models['adv_only_models'].append(adv_model)
 
         # Experiment 2: ADV + GMSC transfer (using selected strategy)
         print(f"  Training ADV + GMSC transfer model (strategy: {training_strategy})...")
 
-        if training_strategy == 'mixed_finetune':
+        if training_strategy == 'hybrid':
+            transfer_m, transfer_model = train_hybrid_multitask_transfer(
+                adv_X_train_s, adv_y_risk_train, adv_y_savings_train,
+                adv_X_val_s, adv_y_risk_val, adv_y_savings_val,
+                gmsc_X_s, gmsc_y,
+                model_config, fold_seed
+            )
+        elif training_strategy == 'mixed_finetune':
             from experiments.domain_transfer import train_mixed_finetune
             transfer_m, transfer_model = train_mixed_finetune(
                 adv_X_train_s, adv_y_risk_train, adv_y_savings_train,
@@ -361,6 +374,40 @@ def run_domain_transfer_cv(
                 gmsc_X_s, gmsc_y,
                 model_config, fold_seed
             )
+
+        # Ensure mandatory risk/savings metrics exist for decision packaging.
+        required = ['risk_mae', 'risk_rmse', 'risk_spearman', 'risk_r2', 'savings_macro_f1', 'savings_accuracy']
+        if any(k not in transfer_m for k in required):
+            try:
+                import torch
+                from scipy.stats import spearmanr
+                from sklearn.metrics import mean_absolute_error, mean_squared_error, f1_score, accuracy_score
+
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                transfer_model.to(device)
+                transfer_model.eval()
+                with torch.no_grad():
+                    x_t = torch.tensor(adv_X_val_s, dtype=torch.float32, device=device)
+                    out = transfer_model.forward(x_t, domain=0)
+                    risk_pred = out['risk'].detach().cpu().numpy().reshape(-1)
+                    savings_prob = torch.sigmoid(out['savings']).detach().cpu().numpy().reshape(-1)
+                    savings_pred = (savings_prob > 0.5).astype(int)
+
+                y_r = np.asarray(adv_y_risk_val).reshape(-1)
+                y_s = np.asarray(adv_y_savings_val).reshape(-1).astype(int)
+
+                transfer_m['risk_mae'] = float(mean_absolute_error(y_r, risk_pred))
+                transfer_m['risk_rmse'] = float(np.sqrt(mean_squared_error(y_r, risk_pred)))
+                if np.std(y_r) > 1e-8 and np.std(risk_pred) > 1e-8:
+                    transfer_m['risk_spearman'] = float(spearmanr(y_r, risk_pred)[0])
+                else:
+                    transfer_m['risk_spearman'] = 0.0
+                transfer_m['risk_r2'] = float(r2_score(y_r, risk_pred))
+                transfer_m['savings_macro_f1'] = float(f1_score(y_s, savings_pred, average='macro', zero_division=0))
+                transfer_m['savings_accuracy'] = float(accuracy_score(y_s, savings_pred))
+            except Exception as e:
+                print(f"  [WARN] Could not backfill missing transfer metrics: {e}")
+
         transfer_metrics.append(transfer_m)
         saved_models['transfer_models'].append(transfer_model)
 
@@ -377,19 +424,21 @@ def run_domain_transfer_cv(
         last_fold_data['transfer_model'] = transfer_model
 
         # Progress report
-        print(f"  ADV-only:  Risk MAE={adv_metrics['risk_mae']:.4f}, "
-              f"Savings F1={adv_metrics['savings_macro_f1']:.4f}")
+        if include_adv_only:
+            print(f"  ADV-only:  Risk MAE={adv_metrics['risk_mae']:.4f}, "
+                  f"Savings F1={adv_metrics['savings_macro_f1']:.4f}")
         print(f"  Transfer:  Risk MAE={transfer_m['risk_mae']:.4f}, "
               f"Savings F1={transfer_m['savings_macro_f1']:.4f}")
 
     # Aggregate results
     results = {
-        'adv_only': _aggregate_metrics(adv_only_metrics),
         'transfer': _aggregate_metrics(transfer_metrics),
         'saved_models': saved_models,
         '_last_fold_data': last_fold_data,
         '_model_config': model_config,
     }
+    if include_adv_only:
+        results['adv_only'] = _aggregate_metrics(adv_only_metrics)
 
     return results
 
@@ -408,12 +457,15 @@ def _aggregate_metrics(metrics_list: list) -> dict:
         if metric_name.startswith('_'):
             continue
         values = [m[metric_name] for m in metrics_list if metric_name in m and m[metric_name] is not None]
-        # Skip if values contain non-numeric types
-        if values and all(isinstance(v, (int, float)) for v in values):
+        # Keep both Python and numpy scalar numerics.
+        numeric_types = (int, float, np.integer, np.floating)
+        if values and all(isinstance(v, numeric_types) for v in values):
+            arr = np.array(values, dtype=float)
             aggregated[metric_name] = {
-                'mean': float(np.mean(values)),
-                'std': float(np.std(values)),
-                'all': [float(v) for v in values]
+                'mean': float(np.mean(arr)),
+                'std': float(np.std(arr)),
+                'median': float(np.median(arr)),
+                'all': [float(v) for v in arr.tolist()]
             }
 
     return aggregated

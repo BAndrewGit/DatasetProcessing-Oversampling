@@ -37,6 +37,7 @@ def run_full_pipeline(
     skip_augmentation: bool = False,
     skip_multitask: bool = False,
     skip_transfer: bool = False,
+    skip_hybrid: bool = False,
     skip_analysis: bool = False,
     skip_tests: bool = False,
     output_dir: str = "runs",
@@ -152,8 +153,10 @@ def run_full_pipeline(
 
     results = {
         'preprocessing': None, 'eda': None, 'baseline_regression': None, 'baseline_classification': None,
-        'augmentation': None, 'multitask': None, 'domain_transfer': None, 'analysis': None, 'tests': None
+        'augmentation': None, 'multitask': None, 'domain_transfer': None, 'hybrid': None,
+        'final_selection': None, 'analysis': None, 'tests': None
     }
+    rejected_experiments = []
     run_dirs = []
 
     # STEP 0: EDA (Exploratory Data Analysis)
@@ -205,75 +208,18 @@ def run_full_pipeline(
     else:
         print_step(1, "BASELINE (SKIP)")
 
-    # STEP 2: LATENT SPACE OVERSAMPLING (replaces old jitter/SMOTE augmentation)
-    # This is now the primary synthetic data generation method using PCA latent space + clustering
-    if not skip_augmentation:
-        print_step(2, "LATENT SPACE OVERSAMPLING (Sprint 2 + Sprint 7)")
-        print("Using PCA latent space + clustering for synthetic data generation")
-        print("(Replaced old jitter/SMOTE methods with proper latent space sampling)")
-        try:
-            latent_cfg = 'configs/latent_sampling/experiment.yaml'
-            latent_test_cfg = 'configs/latent_sampling/test_experiment.yaml'
-            cfg_lat = latent_test_cfg if (test_mode and os.path.exists(latent_test_cfg)) else latent_cfg
-
-            if os.path.exists(cfg_lat):
-                out_latent = os.path.join(PIPELINE_RUN_DIR, f'latent_oversampling_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
-                import subprocess
-                cmd = [sys.executable, '-W', 'ignore::UserWarning',
-                       os.path.join(PROJECT_ROOT, 'runners', 'run_latent_sampling_experiment.py'),
-                       '--config', cfg_lat, '--dataset', dataset_path, '--output', out_latent]
-                print(f"Running latent space oversampling...")
-                result = subprocess.run(cmd, check=False, capture_output=True, text=True,
-                                        encoding='utf-8', errors='replace')
-
-                # Filter out loky/joblib warnings from stderr
-                stderr_filtered = '\n'.join(
-                    line for line in (result.stderr or '').split('\n')
-                    if 'loky' not in line.lower() and 'physical cores' not in line.lower()
-                    and '_count_physical_cores' not in line and 'wmic' not in line.lower()
-                )
-
-                if result.returncode == 0:
-                    results['augmentation'] = out_latent
-                    results['latent'] = out_latent  # Also record as latent for backward compatibility
-                    run_dirs.append(out_latent)
-                    print(f"[OK] Latent oversampling saved to: {out_latent}")
-
-                    # Read verdict from metrics.json (includes quality gate results)
-                    try:
-                        import json as _json
-                        metrics_path = os.path.join(out_latent, 'metrics.json')
-                        if os.path.exists(metrics_path):
-                            with open(metrics_path) as mf:
-                                metrics = _json.load(mf)
-                            # Use verdict from runner if available, otherwise compute
-                            verdict = metrics.get('verdict', 'unknown')
-                            verdict_detail = metrics.get('verdict_detail', '')
-                            synth_used = metrics.get('folds_using_synth', 0)
-                            total_folds = metrics.get('total_folds', 1)
-
-                            if verdict == 'not_useful':
-                                print(f"    [FAIL] Verdict: {verdict} - Quality gates FAILED")
-                                print(f"    Synthetic data NOT recommended for use")
-                            elif verdict == 'partial':
-                                print(f"    [WARN] Verdict: {verdict} ({synth_used}/{total_folds} folds passed)")
-                            else:
-                                print(f"    Verdict: {verdict} ({synth_used}/{total_folds} folds used synthetic)")
-                    except Exception:
-                        pass
-                else:
-                    print(f"[WARN] Latent oversampling failed (rc={result.returncode})")
-                    if stderr_filtered.strip():
-                        print(f"    Error: {stderr_filtered[:500]}")
-            else:
-                print("[WARN] No latent config found; skipping latent oversampling")
-                print(f"    Expected: {latent_cfg} or {latent_test_cfg}")
-        except Exception as e:
-            import traceback
-            print(f"[WARN] Latent oversampling error: {e}")
-            traceback.print_exc()
-    else:
-        print_step(2, "LATENT SPACE OVERSAMPLING (SKIP)")
+    # STEP 2: LATENT OVERSAMPLING (REJECTED EXPERIMENT)
+    print_step(2, "LATENT OVERSAMPLING (REJECTED)")
+    rejection_info = {
+        'experiment': 'latent_oversampling',
+        'status': 'rejected',
+        'used_in_training': False,
+        'used_in_reporting': False,
+        'reason': 'Compromised by leakage risk and non-publicable metrics; kept only as rejected history.',
+    }
+    rejected_experiments.append(rejection_info)
+    results['augmentation'] = rejection_info
+    print("[INFO] Latent oversampling is excluded from final pipeline by policy.")
 
     # STEP 3: Multi-TASK (Sprint 4)
     if not skip_multitask:
@@ -366,8 +312,52 @@ def run_full_pipeline(
     else:
         print_step(4, "DOMAIN TRANSFER (SKIP)")
 
-    # NOTE: Latent sampling is now integrated into Step 2 (LATENT SPACE OVERSAMPLING)
-    # The old Step 4.5 has been removed to avoid duplicate runs
+    # NOTE: Latent oversampling is explicitly retired from production pipeline flow.
+
+    # STEP 4.5: Hybrid Multitask + Transfer (Production candidate)
+    if not skip_hybrid:
+        print_step("4.5", "HYBRID MULTITASK + TRANSFER")
+        try:
+            from runners.run_hybrid_production import run_hybrid_production
+            hybrid_cfg = "configs/transfer/hybrid_transfer.yaml"
+            multitask_cfg = "configs/multitask/experiment.yaml"
+            gmsc = None
+            for candidate in [
+                os.path.join(PROJECT_ROOT, "data", "gmsc", "GiveMeSomeCredit-training.csv"),
+                os.path.join(PROJECT_ROOT, "data", "gmsc", "cs-training.csv"),
+            ]:
+                if os.path.exists(candidate):
+                    gmsc = candidate
+                    break
+            if os.path.exists(hybrid_cfg) and os.path.exists(multitask_cfg) and gmsc:
+                hybrid_result = run_hybrid_production(
+                    multitask_config=multitask_cfg,
+                    transfer_config=hybrid_cfg,
+                    dataset_path=dataset_path,
+                    gmsc_path=gmsc,
+                    output_dir=PIPELINE_RUN_DIR,
+                    source_pipeline_run=PIPELINE_RUN_DIR,
+                    pipeline_run_id=pipeline_run_name,
+                )
+                results['hybrid'] = hybrid_result
+                results['final_selection'] = {
+                    'final_model_family': hybrid_result.get('final_model_family'),
+                    'decision_dir': hybrid_result.get('decision_dir'),
+                    'winner_checkpoint_path': hybrid_result.get('winner_checkpoint_path'),
+                    'bundle_dir': hybrid_result.get('bundle', {}).get('bundle_dir'),
+                }
+                bundle_dir = hybrid_result.get('bundle', {}).get('bundle_dir')
+                if bundle_dir:
+                    run_dirs.append(bundle_dir)
+                print("[OK] Hybrid production bundle generated")
+            else:
+                print("[WARN] Hybrid step skipped (missing config or GMSC dataset)")
+        except Exception as e:
+            import traceback
+            print(f"[WARN] Hybrid step error: {e}")
+            traceback.print_exc()
+    else:
+        print_step("4.5", "HYBRID MULTITASK + TRANSFER (SKIP)")
 
     # STEP 5: Analysis (Sprint 6)
     if not skip_analysis and run_dirs:
@@ -416,7 +406,8 @@ def run_full_pipeline(
         'run_id': pipeline_run_name,
         'timestamp': timestamp,
         'results': results,
-        'run_dirs': run_dirs
+        'run_dirs': run_dirs,
+        'rejected_experiments': rejected_experiments,
     }
     try:
         with open(os.path.join(PIPELINE_RUN_DIR, 'pipeline_summary.json'), 'w', encoding='utf-8') as f:
@@ -444,9 +435,15 @@ def main():
     parser.add_argument('--raw', type=str, default=None, help='Raw dataset path')
     parser.add_argument('--data', '-d', type=str, default=None, help='Encoded dataset path')
     parser.add_argument('--test-mode', action='store_true', help='Run in fast test mode')
+    parser.add_argument('--skip-hybrid', action='store_true', help='Skip hybrid multitask+transfer production step')
     args = parser.parse_args()
 
-    run_full_pipeline(raw_data_path=args.raw, encoded_data_path=args.data, test_mode=args.test_mode)
+    run_full_pipeline(
+        raw_data_path=args.raw,
+        encoded_data_path=args.data,
+        test_mode=args.test_mode,
+        skip_hybrid=args.skip_hybrid,
+    )
 
 
 if __name__ == '__main__':

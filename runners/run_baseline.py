@@ -13,6 +13,7 @@ except ImportError:
 
 import argparse
 import random
+import json
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,6 +25,7 @@ from experiments.io import load_config, save_results, create_run_dir, save_data_
 from experiments.data import load_dataset, preprocess_data, validate_data_integrity, validate_save_money_consistency
 from experiments.models import build_model
 from experiments.cv import run_repeated_cv_regression, run_repeated_cv_classification
+from experiments.sanity_checks import run_minimal_leakage_audit
 
 
 def set_seeds(seed):
@@ -94,6 +96,9 @@ def run_baseline(config_path, dataset_path=None, output_dir=None):
     # Validate data integrity
     validate_data_integrity(X, y, config)
 
+    # Create run directory early so audits are always persisted.
+    run_dir = create_run_dir(config)
+
     print(f"\nDataset shape: {X.shape}")
     print(f"Features: {len(X.columns)}")
 
@@ -105,6 +110,21 @@ def run_baseline(config_path, dataset_path=None, output_dir=None):
     # Build model
     model = build_model(config)
     print(f"\nModel: {config['model']['type']}")
+
+    print("\nRunning minimal leakage audit...")
+    leakage_audit = run_minimal_leakage_audit(
+        X=X,
+        y=y,
+        config=config,
+        model_fn=lambda: build_model(config),
+        seed=seed,
+    )
+    with open(os.path.join(run_dir, 'leakage_audit.json'), 'w', encoding='utf-8') as f:
+        json.dump(leakage_audit, f, indent=2)
+
+    if not leakage_audit.get('overall', {}).get('is_valid', False):
+        failed = leakage_audit.get('failed_checks', [])
+        raise ValueError(f"Leakage audit failed: {failed}. See {os.path.join(run_dir, 'leakage_audit.json')}")
 
     # Run CV
     if target_type == 'regression':
@@ -126,8 +146,6 @@ def run_baseline(config_path, dataset_path=None, output_dir=None):
         print(f"Precision: {cv_results['precision']['mean']:.4f} ± {cv_results['precision']['std']:.4f}")
         print(f"Recall:    {cv_results['recall']['mean']:.4f} ± {cv_results['recall']['std']:.4f}")
 
-    # Create run directory
-    run_dir = create_run_dir(config)
 
     # Save data profile (dataset fingerprint)
     save_data_profile(run_dir, df, X, y, actual_path)
