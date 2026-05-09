@@ -10,6 +10,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from runners.verify_release import verify_release_artifacts
+
 
 def _project_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -202,11 +204,24 @@ def promote_release_bundle(
     }
     _save_json(os.path.join(release_dir, "promotion_manifest.json"), manifest)
 
+    verification = verify_release_artifacts(release_dir=release_dir, releases_dir=releases_dir)
+    if not verification.get("ok"):
+        raise ValueError(
+            "Promoted release failed validation: "
+            + "; ".join(str(error) for error in verification.get("errors", []))
+        )
+
     current_dir = os.path.join(root, "deployment", "current")
     if update_current:
         if os.path.isdir(current_dir):
             shutil.rmtree(current_dir)
         _copy_tree(release_dir, current_dir)
+        current_manifest = dict(manifest)
+        current_manifest["release_dir"] = current_dir
+        current_manifest["bundle_dir"] = os.path.join(current_dir, "bundle")
+        current_manifest["plots_dir"] = os.path.join(current_dir, "plots")
+        current_manifest["current_dir"] = current_dir
+        _save_json(os.path.join(current_dir, "promotion_manifest.json"), current_manifest)
         manifest["current_dir"] = current_dir
 
     return manifest

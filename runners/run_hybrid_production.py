@@ -241,7 +241,7 @@ def run_hybrid_production(
     hybrid_model_path = transfer_model_path
     hybrid_scaler_path = adv_scaler_path
 
-    features = _feature_columns(dataset_path)
+    features = json.load(open(os.path.join(multitask_run_dir, "feature_columns.json")))
     rules = {
         "thresholds": {
             "discretionary_spending_high": 3.0,

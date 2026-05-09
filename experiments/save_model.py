@@ -9,6 +9,13 @@ from datetime import datetime
 
 import yaml
 
+from experiments.model_contract import (
+    MODEL_FEATURE_COLUMNS,
+    MODEL_INPUT_DIM,
+    MODEL_SCALER_MODE,
+    MODEL_SCALED_FEATURE_COLUMNS,
+)
+
 def save_sklearn_model(obj, path):
     """Save an sklearn-compatible object (pipeline, scaler, estimator) using joblib.
     Returns the path on success.
@@ -64,6 +71,14 @@ def export_inference_bundle(
     """Export a frozen inference bundle for external applications."""
     os.makedirs(bundle_dir, exist_ok=True)
 
+    expected_feature_columns = list(MODEL_FEATURE_COLUMNS)
+    provided_feature_columns = list(feature_columns)
+    if provided_feature_columns != expected_feature_columns:
+        raise ValueError(
+            "Feature contract mismatch: export_inference_bundle expected the canonical "
+            f"shared contract with {len(expected_feature_columns)} columns."
+        )
+
     model_dst = os.path.join(bundle_dir, 'model.pt')
     scaler_dst = os.path.join(bundle_dir, 'scaler.pkl')
     features_dst = os.path.join(bundle_dir, 'feature_columns.json')
@@ -75,13 +90,39 @@ def export_inference_bundle(
     shutil.copyfile(scaler_src_path, scaler_dst)
 
     with open(features_dst, 'w', encoding='utf-8') as f:
-        json.dump(feature_columns, f, indent=2)
+        json.dump(expected_feature_columns, f, indent=2)
     with open(rules_dst, 'w', encoding='utf-8') as f:
         yaml.safe_dump(bank_mapping_rules, f, sort_keys=False)
     with open(thresholds_dst, 'w', encoding='utf-8') as f:
         json.dump(thresholds, f, indent=2)
 
     metadata_out = dict(metadata)
+    model_config = metadata_out.get('model_config')
+    if isinstance(model_config, dict):
+        model_config = dict(model_config)
+        if 'input_dim' in model_config and int(model_config['input_dim']) != MODEL_INPUT_DIM:
+            raise ValueError(
+                "Feature contract mismatch: model_config.input_dim does not match the shared contract"
+            )
+        model_config['input_dim'] = MODEL_INPUT_DIM
+        metadata_out['model_config'] = model_config
+
+    if 'input_dim' in metadata_out and int(metadata_out['input_dim']) != MODEL_INPUT_DIM:
+        raise ValueError("Feature contract mismatch: metadata input_dim does not match the shared contract")
+    metadata_out['input_dim'] = MODEL_INPUT_DIM
+
+    if 'scaled_feature_columns' in metadata_out:
+        scaled_feature_columns = list(metadata_out['scaled_feature_columns'])
+        if scaled_feature_columns != list(MODEL_SCALED_FEATURE_COLUMNS):
+            raise ValueError(
+                "Feature contract mismatch: metadata scaled_feature_columns does not match the shared contract"
+            )
+    metadata_out['scaled_feature_columns'] = list(MODEL_SCALED_FEATURE_COLUMNS)
+
+    if 'scaler_mode' in metadata_out and metadata_out['scaler_mode'] != MODEL_SCALER_MODE:
+        raise ValueError("Feature contract mismatch: metadata scaler_mode does not match the shared contract")
+    metadata_out['scaler_mode'] = MODEL_SCALER_MODE
+
     metadata_out['exported_at'] = datetime.now().isoformat()
     with open(metadata_dst, 'w', encoding='utf-8') as f:
         json.dump(metadata_out, f, indent=2)

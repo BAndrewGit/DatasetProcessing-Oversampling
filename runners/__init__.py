@@ -10,7 +10,10 @@ from . import run_experiment
 from . import run_multitask_experiment
 from . import run_domain_transfer_experiment
 from . import run_analysis
-from . import augmentation_experiment
+try:
+    from . import augmentation_experiment
+except ModuleNotFoundError:
+    augmentation_experiment = None
 
 __all__ = [
     'run_baseline',

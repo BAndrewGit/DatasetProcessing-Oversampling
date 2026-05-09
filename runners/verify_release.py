@@ -6,6 +6,20 @@ import os
 import sys
 from datetime import datetime
 
+import yaml
+
+RUNNERS_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(RUNNERS_DIR)
+sys.path.insert(0, RUNNERS_DIR)
+sys.path.insert(0, PROJECT_ROOT)
+
+from experiments.model_contract import (
+    MODEL_FEATURE_COLUMNS,
+    MODEL_INPUT_DIM,
+    MODEL_SCALER_MODE,
+    MODEL_SCALED_FEATURE_COLUMNS,
+)
+
 
 REQUIRED_BUNDLE_FILES = [
     "model.pt",
@@ -54,8 +68,91 @@ def _load_json(path: str) -> dict:
         return json.load(f)
 
 
+def _load_yaml(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _file_size(path: str) -> int:
+    return os.path.getsize(path)
+
+
 def _normalize(path: str) -> str:
     return os.path.normcase(os.path.abspath(path))
+
+
+def _validate_feature_contract(report: dict, feature_columns: list, model_metadata: dict) -> None:
+    if not feature_columns:
+        report["ok"] = False
+        report["errors"].append("feature_columns.json is empty")
+        return
+
+    if any(not isinstance(column, str) or not column.strip() for column in feature_columns):
+        report["ok"] = False
+        report["errors"].append("feature_columns.json contains invalid feature names")
+        return
+
+    if len(set(feature_columns)) != len(feature_columns):
+        report["ok"] = False
+        report["errors"].append("feature_columns.json contains duplicate feature names")
+        return
+
+    expected_feature_columns = list(MODEL_FEATURE_COLUMNS)
+    if feature_columns != expected_feature_columns:
+        report["ok"] = False
+        report["errors"].append(
+            "Feature contract mismatch: feature_columns.json does not match the shared canonical contract"
+        )
+
+    model_config = model_metadata.get("model_config")
+    input_dim = None
+    if isinstance(model_config, dict) and isinstance(model_config.get("input_dim"), int):
+        input_dim = int(model_config["input_dim"])
+    elif isinstance(model_metadata.get("input_dim"), int):
+        input_dim = int(model_metadata["input_dim"])
+    else:
+        report["ok"] = False
+        report["errors"].append("model_metadata.json is missing input_dim")
+
+    if input_dim is not None and input_dim != MODEL_INPUT_DIM:
+        report["ok"] = False
+        report["errors"].append(
+            "Feature contract mismatch: model_metadata input_dim does not match the shared canonical contract"
+        )
+
+    if input_dim is not None and len(feature_columns) != input_dim:
+        report["ok"] = False
+        report["errors"].append(
+            "Feature contract mismatch: "
+            f"feature_columns.json has {len(feature_columns)} entries, but model_metadata "
+            f"declares input_dim={input_dim}"
+        )
+
+    scaled_feature_columns = model_metadata.get("scaled_feature_columns")
+    if scaled_feature_columns is None:
+        report["ok"] = False
+        report["errors"].append("model_metadata.json is missing scaled_feature_columns")
+        return
+
+    if not isinstance(scaled_feature_columns, list) or any(
+        not isinstance(column, str) or not column.strip() for column in scaled_feature_columns
+    ):
+        report["ok"] = False
+        report["errors"].append("model_metadata.json has invalid scaled_feature_columns")
+        return
+
+    expected_scaled_feature_columns = list(MODEL_SCALED_FEATURE_COLUMNS)
+    if scaled_feature_columns != expected_scaled_feature_columns:
+        report["ok"] = False
+        report["errors"].append(
+            "Feature contract mismatch: model_metadata scaled_feature_columns do not match the shared canonical contract"
+        )
+
+    if model_metadata.get("scaler_mode") != MODEL_SCALER_MODE:
+        report["ok"] = False
+        report["errors"].append(
+            "Feature contract mismatch: model_metadata scaler_mode does not match the shared canonical contract"
+        )
 
 
 def verify_release_artifacts(
@@ -109,6 +206,9 @@ def verify_release_artifacts(
         report["checks"][f"bundle:{name}"] = exists
         if not exists:
             fail(f"Missing bundle file: {path}")
+            continue
+        if _file_size(path) <= 32:
+            fail(f"Bundle file too small to be valid: {path}")
 
     for name in REQUIRED_SNAPSHOT_FILES:
         path = os.path.join(snapshot_dir, name)
@@ -116,6 +216,14 @@ def verify_release_artifacts(
         report["checks"][f"snapshot:{name}"] = exists
         if not exists:
             fail(f"Missing decision snapshot file: {path}")
+            continue
+        if _file_size(path) <= 0:
+            fail(f"Decision snapshot file is empty: {path}")
+            continue
+        try:
+            _load_json(path)
+        except Exception as exc:
+            fail(f"Invalid JSON in decision snapshot file {path}: {exc}")
 
     for name in REQUIRED_PLOT_FILES:
         path = os.path.join(plots_dir, name)
@@ -123,6 +231,9 @@ def verify_release_artifacts(
         report["checks"][f"plot:{name}"] = exists
         if not exists:
             fail(f"Missing plot file: {path}")
+            continue
+        if _file_size(path) <= 0:
+            fail(f"Plot file is empty: {path}")
 
     # Validate manifest consistency.
     if manifest:
@@ -190,6 +301,27 @@ def verify_release_artifacts(
                     report["warnings"].append(
                         f"Manifest does not include optional field: {source_field}"
                     )
+
+    # Validate bundle content consistency after the file existence checks.
+    if report["ok"]:
+        try:
+            feature_columns = _load_json(os.path.join(bundle_dir, "feature_columns.json"))
+            thresholds = _load_json(os.path.join(bundle_dir, "thresholds.json"))
+            model_metadata = _load_json(os.path.join(bundle_dir, "model_metadata.json"))
+            bank_mapping_rules = _load_yaml(os.path.join(bundle_dir, "bank_mapping_rules.yaml"))
+        except Exception as exc:
+            fail(f"Failed to parse bundle artifacts: {exc}")
+        else:
+            if not isinstance(feature_columns, list):
+                fail("feature_columns.json must contain a JSON array")
+            if not isinstance(thresholds, dict):
+                fail("thresholds.json must contain a JSON object")
+            if not isinstance(model_metadata, dict):
+                fail("model_metadata.json must contain a JSON object")
+            if not isinstance(bank_mapping_rules, dict):
+                fail("bank_mapping_rules.yaml must contain a YAML object")
+            if isinstance(feature_columns, list) and isinstance(model_metadata, dict):
+                _validate_feature_contract(report, feature_columns, model_metadata)
 
     return report
 

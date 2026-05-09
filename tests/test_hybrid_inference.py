@@ -88,3 +88,4 @@ def test_hybrid_inference_predict_and_explain_contract(tmp_path):
     for key in ["risk_score", "top_factors", "alerts", "confidence"]:
         assert key in exp
 
+

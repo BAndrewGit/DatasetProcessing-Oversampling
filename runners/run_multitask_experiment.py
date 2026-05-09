@@ -22,6 +22,12 @@ import json
 from experiments.config_schema import validate_config, ConfigValidationError, FORBIDDEN_TARGETS
 from experiments.io import load_config, create_run_dir
 from experiments.data import load_dataset, validate_save_money_consistency, RISK_SCORE_COMPONENTS
+from experiments.model_contract import (
+    MODEL_FEATURE_COLUMNS,
+    MODEL_INPUT_DIM,
+    MODEL_SCALER_MODE,
+    MODEL_SCALED_FEATURE_COLUMNS,
+)
 from experiments.multitask import train_single_task_risk, train_single_task_savings, train_multitask
 from experiments.multitask_plots import generate_all_multitask_plots
 from sklearn.model_selection import RepeatedKFold, RepeatedStratifiedKFold
@@ -44,81 +50,39 @@ def set_seeds(seed):
 
 def preprocess_multitask_data(df, config):
     """
-    Preprocess data for multi-task learning.
-
-    CRITICAL: Excludes RISK_SCORE_COMPONENTS to prevent leakage!
-    These columns are used to calculate Risk_Score, so including them
-    would make the task trivially easy and contaminate results.
+    Preprocess data for multi-task learning using the shared model contract.
 
     Returns:
         X: Feature matrix
         y_risk: Risk_Score target
         y_savings: Save_Money_Yes target
     """
-    # Columns to drop/ignore
-    cols_to_drop = config['preprocessing'].get('columns_to_drop', [])
-    ignored = config['preprocessing'].get('ignored_columns', [])
-
-    # Hard constraint: Behavior_Risk_Level must be excluded
-    if 'Behavior_Risk_Level' not in ignored:
-        ignored.append('Behavior_Risk_Level')
-
-    # CRITICAL: Save_Money_No is the complement of Save_Money_Yes - must exclude!
-    if 'Save_Money_No' not in ignored:
-        ignored.append('Save_Money_No')
-        print("EXCLUDED (complement of target): Save_Money_No")
-
-    # CRITICAL: Exclude features with very high correlation to savings target (quasi-leakage)
-    # These make the task trivially easy and don't generalize
-    SAVINGS_QUASI_LEAKAGE_THRESHOLD = 0.7
-    savings_target = 'Save_Money_Yes'
-    if savings_target in df.columns:
-        high_corr_cols = []
-        for col in df.columns:
-            if col in [savings_target, 'Save_Money_No']:
-                continue
-            try:
-                corr = abs(df[col].corr(df[savings_target]))
-                if corr >= SAVINGS_QUASI_LEAKAGE_THRESHOLD:
-                    high_corr_cols.append((col, corr))
-            except:
-                pass
-        if high_corr_cols:
-            for col, corr in high_corr_cols:
-                if col not in ignored:
-                    ignored.append(col)
-            print(f"EXCLUDED (quasi-leakage, r>{SAVINGS_QUASI_LEAKAGE_THRESHOLD}): {[c for c,_ in high_corr_cols]}")
-
-    # Targets
     risk_target = 'Risk_Score'
     savings_target = 'Save_Money_Yes'
 
-    # Verify targets exist
     if risk_target not in df.columns:
         raise ValueError(f"Risk target '{risk_target}' not found in dataset")
     if savings_target not in df.columns:
         raise ValueError(f"Savings target '{savings_target}' not found in dataset")
 
-    # =========================================================================
-    # FIX 1: EXCLUDE RISK_SCORE_COMPONENTS (LEAKAGE PREVENTION)
-    # =========================================================================
-    leakage_cols = [c for c in RISK_SCORE_COMPONENTS if c in df.columns]
+    leakage_cols = [column for column in MODEL_FEATURE_COLUMNS if column in RISK_SCORE_COMPONENTS]
     if leakage_cols:
-        print(f"EXCLUDED (leakage prevention): {leakage_cols}")
+        raise ValueError(f"Model contract contains leakage columns: {leakage_cols}")
 
-    # Build feature set - exclude targets, ignored, dropped, AND leakage cols
-    exclude_cols = [risk_target, savings_target] + ignored + cols_to_drop + leakage_cols
-    feature_cols = [c for c in df.columns if c not in exclude_cols]
+    forbidden_in_contract = [
+        column
+        for column in MODEL_FEATURE_COLUMNS
+        if column in set(FORBIDDEN_TARGETS)
+        or column in {"Save_Money_No", risk_target, savings_target, "Behavior_Risk_Level"}
+    ]
+    if forbidden_in_contract:
+        raise ValueError(f"Model contract contains forbidden columns: {forbidden_in_contract}")
 
-    # Verify no forbidden columns in features
-    for col in feature_cols:
-        if col in FORBIDDEN_TARGETS:
-            raise ValueError(f"BLOCKED: Forbidden column '{col}' found in features!")
+    missing_features = [column for column in MODEL_FEATURE_COLUMNS if column not in df.columns]
+    if missing_features:
+        raise ValueError(f"Dataset is missing required model features: {missing_features}")
 
-    # DOUBLE-CHECK: Verify no leakage columns slipped through
-    bad_cols = [c for c in feature_cols if c in RISK_SCORE_COMPONENTS]
-    if bad_cols:
-        raise ValueError(f"LEAKAGE BUG: Risk_Score components in multitask features: {bad_cols}")
+    feature_cols = list(MODEL_FEATURE_COLUMNS)
 
     X = df[feature_cols].copy()
     y_risk = df[risk_target].copy()
@@ -141,7 +105,8 @@ def preprocess_multitask_data(df, config):
         )
 
     print(f"\nFeatures: {len(feature_cols)}")
-    print(f"Ignored columns: {ignored}")
+    print(f"Contract input_dim: {MODEL_INPUT_DIM}")
+    print(f"Scaled columns: {MODEL_SCALED_FEATURE_COLUMNS}")
     print(f"Risk target distribution: mean={y_risk.mean():.4f}, std={y_risk.std():.4f}")
     print(f"Savings target distribution: {y_savings.value_counts().to_dict()}")
 
@@ -204,9 +169,16 @@ def run_multitask_cv(X, y_risk, y_savings, config, multitask_only=False):
         if (fold_idx + 1) % 5 == 0 or fold_idx == 0:
             print(f"  Fold {fold_idx + 1}/{total_folds}...")
 
-        X_train, X_val = X.iloc[train_idx].values, X.iloc[val_idx].values
-        y_risk_train, y_risk_val = y_risk.iloc[train_idx].values, y_risk.iloc[val_idx].values
-        y_savings_train, y_savings_val = y_savings.iloc[train_idx].values, y_savings.iloc[val_idx].values
+
+        # Partial Scaling
+        from sklearn.preprocessing import StandardScaler
+        scale_cols = list(MODEL_SCALED_FEATURE_COLUMNS)
+        scale_idx = [i for i, c in enumerate(X.columns) if c in scale_cols]
+        fold_scaler = StandardScaler()
+        if scale_idx:
+            X_train[:, scale_idx] = fold_scaler.fit_transform(X_train[:, scale_idx])
+            X_val[:, scale_idx] = fold_scaler.transform(X_val[:, scale_idx])
+
 
         if not multitask_only:
             # Risk-only
@@ -385,14 +357,18 @@ def run_multitask_experiment(config_path, dataset_path=None, output_dir=None, mu
     # Preprocess for multi-task
     X, y_risk, y_savings = preprocess_multitask_data(df, config)
 
+    # Save results
+    run_dir = create_run_dir(config)
+
+    with open(os.path.join(run_dir, "feature_columns.json"), "w") as f:
+        json.dump(list(MODEL_FEATURE_COLUMNS), f, indent=2)
+
     # Run CV ablation
     results, saved_models = run_multitask_cv(X, y_risk, y_savings, config, multitask_only=multitask_only)
 
     # Print results
     print_results(results)
 
-    # Save results
-    run_dir = create_run_dir(config)
 
     # ==========================================================================
     # GENERATE MULTITASK PLOTS
@@ -456,12 +432,11 @@ def run_multitask_experiment(config_path, dataset_path=None, output_dir=None, mu
         import joblib as _joblib
 
         scaler = StandardScaler()
-        # X may be a DataFrame from preprocess; fit on full features
-        try:
-            _X_for_scaler = X.values if hasattr(X, 'values') else X
-        except Exception:
-            _X_for_scaler = X
-        scaler.fit(_X_for_scaler)
+        scale_cols = list(MODEL_SCALED_FEATURE_COLUMNS)
+        scale_idx = [i for i, c in enumerate(X.columns) if c in scale_cols]
+        if scale_idx:
+            scaler.fit(X.iloc[:, scale_idx].values)
+
         scaler_path = os.path.join(run_dir, 'scaler.joblib')
         save_sklearn_model(scaler, scaler_path)
 
@@ -476,6 +451,10 @@ def run_multitask_experiment(config_path, dataset_path=None, output_dir=None, mu
                 'scaler': 'scaler.joblib'
             }
         }
+        metadata['scaled_feature_columns'] = list(MODEL_SCALED_FEATURE_COLUMNS)
+        metadata['scaler_mode'] = MODEL_SCALER_MODE
+        metadata['input_dim'] = MODEL_INPUT_DIM
+
         write_model_metadata(run_dir, metadata)
     except Exception as e:
         print(f"Warning: failed to save scaler or metadata for multitask run: {e}")
