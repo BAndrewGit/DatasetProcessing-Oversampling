@@ -111,4 +111,4 @@ python -m pytest -q
 
 ## Related Project
 
-[BankStatementConvertor](https://github.com/BAndrewGit/BankStatementConvertor) is a companion application that processes bank statements and integrates an exported PyTorch model for experimental inference.
+[Bank Statement Analytics]([https://github.com/BAndrewGit/BankStatementConvertor](https://github.com/BAndrewGit/Bank-Statement-Analytics)) is a companion application that processes bank statements and integrates an exported PyTorch model for experimental inference.
